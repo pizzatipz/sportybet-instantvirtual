@@ -1117,124 +1117,119 @@ async def full_bet_and_kickoff(page, fixture_idx: int = 0, selection: str = "Awa
 
 
 async def place_strategic_bets(page, fixtures: list[dict], selection: str = "Away/ Home"):
-    """
-    Place bets on all fixtures that match our strategy.
-
-    Flow for each qualifying fixture:
-    1. Click fixture → match detail
-    2. Scroll to HT/FT, select Away/Home
-    3. Place Bet → Confirm
-    4. Go back to betting list
-    5. Repeat for next fixture
-    Then: Kick Off → Skip to Result
-
-    Args:
-        page: iframe frame on betting screen
-        fixtures: list of fixture dicts from scrape_betting_screen()
-        selection: HT/FT outcome to bet on
-
-    Returns number of bets placed.
-    """
-    # Find qualifying fixtures
-    qualifying = []
+    """Place bets on qualifying fixtures using category tabs for navigation."""
+    from collections import defaultdict as _dd
+    by_category = _dd(list)
     for idx, f in enumerate(fixtures):
         if fixture_matches_strategy(f):
-            qualifying.append((idx, f))
+            by_category[f["category"]].append(f)
 
-    if not qualifying:
+    total_qualifying = sum(len(v) for v in by_category.values())
+    if total_qualifying == 0:
         print("  No fixtures match the strategy this round.")
         return 0
 
-    print(f"\n  🎯 {len(qualifying)} fixtures match strategy:")
-    for idx, f in qualifying[:5]:
-        print(f"     [{idx}] {f['category']}: {f['home_team']} vs {f['away_team']}")
-    if len(qualifying) > 5:
-        print(f"     ... and {len(qualifying) - 5} more")
+    print(f"\n  \U0001f3af {total_qualifying} fixtures across {len(by_category)} categories:")
+    for cat, fxs in by_category.items():
+        teams = ", ".join(f"{fx['home_team']}v{fx['away_team']}" for fx in fxs[:3])
+        extra = f" +{len(fxs)-3}" if len(fxs) > 3 else ""
+        print(f"     {cat}: {teams}{extra}")
 
     bets_placed = 0
-    for fixture_num, (idx, f) in enumerate(qualifying):
-        cat = f['category']
-        home = f['home_team']
-        away = f['away_team']
-        print(f"\n  📌 Bet {fixture_num + 1}/{len(qualifying)}: {home} vs {away} ({cat})")
+    bet_num = 0
 
-        # Re-query fixture rows (DOM refreshes after each back navigation)
-        fixture_rows = await page.query_selector_all(
-            ".event-list.spacer-team .event-list__main .teams-cell"
-        )
+    for cat, cat_fixtures in by_category.items():
+        # Click category tab at the top
+        tab_clicked = await page.evaluate(r"""(catName) => {
+            const tabs = document.querySelectorAll('li.sport-type-item');
+            for (const tab of tabs) {
+                const txt = (tab.textContent || '').trim();
+                if (txt === catName) { tab.click(); return true; }
+            }
+            return false;
+        }""", cat)
 
-        # Find the fixture by matching team names (not index — DOM shifts)
-        target_row = None
-        for row in fixture_rows:
-            row_text = (await row.text_content() or "")
-            if home in row_text and away in row_text:
-                target_row = row
-                break
-
-        if not target_row:
-            print(f"    ⚠️  Could not find fixture in DOM")
+        if not tab_clicked:
+            print(f"\n  \u26a0\ufe0f  Could not find tab for '{cat}'")
             continue
+        await asyncio.sleep(0.8)
 
-        # Click the fixture to open detail page
-        try:
-            await target_row.click()
+        for f in cat_fixtures:
+            home = f["home_team"]
+            away = f["away_team"]
+            bet_num += 1
+            print(f"\n  \U0001f4cc Bet {bet_num}/{total_qualifying}: {home} vs {away} ({cat})")
+
+            # Find and click fixture by team names in current category
+            clicked = await page.evaluate(r"""(args) => {
+                const [home, away] = args;
+                const cells = document.querySelectorAll('.event-list .teams-cell, .teams-info-wrap');
+                for (const cell of cells) {
+                    const txt = cell.textContent || '';
+                    if (txt.includes(home) && txt.includes(away)) {
+                        cell.scrollIntoView({ behavior: 'instant', block: 'center' });
+                        cell.click();
+                        return true;
+                    }
+                }
+                return false;
+            }""", [home, away])
+
+            if not clicked:
+                print(f"    \u26a0\ufe0f  Could not find fixture")
+                continue
             await asyncio.sleep(1.5)
-        except Exception:
-            print(f"    ⚠️  Could not click fixture")
-            continue
 
-        # Verify we're on the detail page
-        detail = await page.query_selector("span[data-op='event_detail__market']")
-        if not detail:
-            print(f"    ⚠️  Detail page didn't load")
+            # Verify detail page
+            detail = await page.query_selector("span[data-op='event_detail__market']")
+            if not detail:
+                print(f"    \u26a0\ufe0f  Detail page not loaded")
+                await go_back_to_betting(page)
+                continue
+
+            # Scrape HT/FT odds
+            odds = await scrape_htft_odds_from_detail(page)
+            if odds:
+                print(f"    \U0001f4ca Away/Home odds: {odds.get('away_home', '?')}")
+
+            # Select outcome
+            if not await select_htft_outcome(page, selection):
+                print(f"    \u26a0\ufe0f  Could not select outcome")
+                await go_back_to_betting(page)
+                continue
+            await asyncio.sleep(1)
+
+            # Place Bet
+            if not await click_place_bet(page):
+                print(f"    \u26a0\ufe0f  Place Bet failed")
+                await go_back_to_betting(page)
+                continue
+
+            # Confirm
+            if await click_confirm(page):
+                bets_placed += 1
+                print(f"    \u2705 Bet confirmed!")
+            else:
+                print(f"    \u26a0\ufe0f  Confirm failed")
+
+            # Back to betting list
             await go_back_to_betting(page)
-            continue
+            await asyncio.sleep(1)
 
-        # Scrape HT/FT odds
-        odds = await scrape_htft_odds_from_detail(page)
-        if odds:
-            ah_odds = odds.get("away_home", "?")
-            print(f"    📊 Away/Home odds: {ah_odds}")
-
-        # Select the outcome
-        if not await select_htft_outcome(page, selection):
-            print(f"    ⚠️  Could not select '{selection}'")
-            await go_back_to_betting(page)
-            continue
-
-        await asyncio.sleep(1)
-
-        # Place Bet
-        if not await click_place_bet(page):
-            print(f"    ⚠️  Place Bet failed")
-            await go_back_to_betting(page)
-            continue
-
-        # Confirm
-        if await click_confirm(page):
-            bets_placed += 1
-            print(f"    ✅ Bet confirmed!")
-        else:
-            print(f"    ⚠️  Confirm failed")
-
-        # Go back to betting list for the next fixture
-        await go_back_to_betting(page)
-        await asyncio.sleep(1)
-
-    print(f"\n  💰 {bets_placed}/{len(qualifying)} bets placed this round")
+    print(f"\n  \U0001f4b0 {bets_placed}/{total_qualifying} bets placed this round")
 
     # Kick Off
     await asyncio.sleep(1)
     if await click_kick_off(page):
-        print("  ⚽ Kick Off!")
+        print("  \u26bd Kick Off!")
     else:
-        print("  ⚠️  Kick Off not found, trying Next Round...")
+        print("  \u26a0\ufe0f  Kick Off not found, trying Next Round...")
         await click_next_round(page)
 
     # Skip to Result
     await asyncio.sleep(3)
     if await click_skip_to_result(page):
-        print("  ⏭️  Skipped to result")
+        print("  \u23ed\ufe0f  Skipped to result")
 
     return bets_placed
 
