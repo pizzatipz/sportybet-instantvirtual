@@ -669,7 +669,14 @@ async def wait_for_results(page, timeout_s: int = 180) -> bool:
 
 
 async def click_next_round(page) -> bool:
-    """Click the 'Next Round' button. Returns True if found and clicked."""
+    """Click the 'Next Round' button. Returns True if found and clicked.
+    
+    Also handles the winning splash screen popup that may appear after
+    results — it has its own 'Next Round' button in the center.
+    """
+    # First try to dismiss any winning splash popup
+    await dismiss_win_splash(page)
+
     btn = await page.query_selector(
         "span[data-cms-key='next_round'], div[data-cms-key='next_round']"
     )
@@ -678,6 +685,81 @@ async def click_next_round(page) -> bool:
         await asyncio.sleep(2)
         return True
     return False
+
+
+async def dismiss_win_splash(page) -> bool:
+    """Dismiss the winning splash screen popup if present.
+    
+    After results, if any bet won, a popup appears with id='winngin-pop'
+    (SportyBet's typo). It blocks all interaction until dismissed.
+    """
+    try:
+        dismissed = await page.evaluate(r"""() => {
+            // Primary: the exact SportyBet winning popup (note: "winngin" typo)
+            const winPop = document.querySelector('#winngin-pop');
+            if (winPop && winPop.offsetHeight > 0) {
+                // Find Next Round or any clickable button inside it
+                const btns = winPop.querySelectorAll('span, button, div, a');
+                for (const btn of btns) {
+                    const txt = (btn.textContent || '').trim();
+                    if ((txt === 'Next Round' || txt === 'NEXT ROUND' || txt === 'OK' ||
+                         txt === 'Continue' || txt === 'Close' || txt === 'Got it')
+                        && btn.offsetHeight > 0 && btn.children.length < 3) {
+                        btn.click();
+                        return 'winngin-pop: ' + txt;
+                    }
+                }
+                // Click the popup content itself as fallback
+                const content = winPop.querySelector('.content');
+                if (content) { content.click(); return 'winngin-pop: content'; }
+                winPop.click();
+                return 'winngin-pop: self';
+            }
+            
+            // Fallback: search for any overlay blocking the page
+            const overlays = document.querySelectorAll(
+                '.m-dialog, .m-dialog-main, [class*="popup"], [class*="splash"], ' +
+                '[class*="congratulation"], [class*="winning"], [class*="winngin"], ' +
+                '[class*="won"], [class*="modal"], [class*="overlay"], [class*="result-pop"]'
+            );
+            
+            for (const overlay of overlays) {
+                if (overlay.offsetHeight === 0) continue;
+                const btns = overlay.querySelectorAll('span, button, div, a');
+                for (const btn of btns) {
+                    const txt = (btn.textContent || '').trim();
+                    if ((txt === 'Next Round' || txt === 'NEXT ROUND' || 
+                         txt === 'Continue' || txt === 'OK' || txt === 'Close' || txt === 'Got it')
+                        && btn.offsetHeight > 0 && btn.children.length < 3) {
+                        btn.click();
+                        return 'overlay: ' + txt;
+                    }
+                }
+            }
+            
+            // Last resort: any visible "Next Round" NOT in bottom nav
+            const allEls = document.querySelectorAll('span, div');
+            for (const el of allEls) {
+                const txt = (el.textContent || '').trim();
+                if (txt === 'Next Round' && el.offsetHeight > 0 && el.children.length < 2) {
+                    const parent = el.closest('.nav-bottom-left, .nav-bottom-right, .btn-nav-bottom');
+                    if (!parent) {
+                        el.click();
+                        return 'popup-next-round';
+                    }
+                }
+            }
+            
+            return null;
+        }""")
+        
+        if dismissed:
+            print(f"  🎉 Win splash dismissed ({dismissed})")
+            await asyncio.sleep(2)
+            return True
+        return False
+    except Exception:
+        return False
 
 
 # ──────────────────────────────────────────────────────────
@@ -1118,6 +1200,8 @@ async def full_bet_and_kickoff(page, fixture_idx: int = 0, selection: str = "Awa
 
 async def place_strategic_bets(page, fixtures: list[dict], selection: str = "Away/ Home"):
     """Place bets on qualifying fixtures using category tabs for navigation."""
+    MAX_BETS_PER_ROUND = 30  # SportyBet limit
+
     from collections import defaultdict as _dd
     by_category = _dd(list)
     for idx, f in enumerate(fixtures):
@@ -1128,6 +1212,45 @@ async def place_strategic_bets(page, fixtures: list[dict], selection: str = "Awa
     if total_qualifying == 0:
         print("  No fixtures match the strategy this round.")
         return 0
+
+    # Cap at 30 bets — distribute evenly across ALL target categories
+    if total_qualifying > MAX_BETS_PER_ROUND:
+        print(f"\n  {total_qualifying} qualifying fixtures, capping at {MAX_BETS_PER_ROUND}")
+
+        # Round-robin: take fixtures from each target category evenly
+        target_cats = [c for c in by_category if c in TARGET_CATEGORIES]
+        other_cats = [c for c in by_category if c not in TARGET_CATEGORIES]
+
+        new_by_cat = _dd(list)
+        remaining = MAX_BETS_PER_ROUND
+
+        if target_cats:
+            # Distribute evenly across target categories
+            per_cat = max(1, remaining // len(target_cats))
+            for cat in target_cats:
+                take = min(per_cat, len(by_category[cat]), remaining)
+                new_by_cat[cat] = by_category[cat][:take]
+                remaining -= take
+
+            # If any slots left, fill from target categories that have more
+            for cat in target_cats:
+                if remaining <= 0:
+                    break
+                extra = by_category[cat][len(new_by_cat[cat]):]
+                take = min(len(extra), remaining)
+                new_by_cat[cat].extend(extra[:take])
+                remaining -= take
+
+        # Fill remaining slots from non-target categories
+        for cat in other_cats:
+            if remaining <= 0:
+                break
+            take = min(len(by_category[cat]), remaining)
+            new_by_cat[cat] = by_category[cat][:take]
+            remaining -= take
+
+        by_category = new_by_cat
+        total_qualifying = sum(len(v) for v in by_category.values())
 
     print(f"\n  \U0001f3af {total_qualifying} fixtures across {len(by_category)} categories:")
     for cat, fxs in by_category.items():
@@ -1212,13 +1335,74 @@ async def place_strategic_bets(page, fixtures: list[dict], selection: str = "Awa
             else:
                 print(f"    \u26a0\ufe0f  Confirm failed")
 
-            # Back to betting list
+            # Back to betting list — may need multiple back clicks
             await go_back_to_betting(page)
             await asyncio.sleep(1)
+            # Verify we're back on the betting list (league tabs visible)
+            for _ in range(5):
+                has_tabs = await page.query_selector("li.sport-type-item[data-op='iv-league-tabs']")
+                if has_tabs:
+                    break
+                # Try another back click
+                await go_back_to_betting(page)
+                await asyncio.sleep(1)
 
     print(f"\n  \U0001f4b0 {bets_placed}/{total_qualifying} bets placed this round")
 
-    # Kick Off
+    # Click "Open Bets" (bottom left) to show pending bets
+    await asyncio.sleep(1)
+    open_bets_clicked = False
+
+    # Try Playwright selectors with force click (bypasses badge overlay)
+    for selector in [
+        "[data-op='iv-main-open-bets']",
+        ".nav-bottom-left .action-button-sub-container",
+        ".nav-bottom-left span",
+        ".nav-bottom-left",
+    ]:
+        btn = await page.query_selector(selector)
+        if btn:
+            try:
+                await btn.click(force=True)
+                open_bets_clicked = True
+                print(f"  \U0001f4cb Open Bets clicked ({selector})")
+                await asyncio.sleep(2)
+                break
+            except Exception:
+                continue
+
+    if not open_bets_clicked:
+        # JS fallback with more aggressive targeting
+        result = await page.evaluate(r"""() => {
+            // Find the Open Bets text element and force click its parent
+            const els = document.querySelectorAll('span, div');
+            for (const el of els) {
+                const txt = (el.textContent || '').trim();
+                if (txt.startsWith('Open Bets') && el.offsetHeight > 0) {
+                    // Click the element itself
+                    el.click();
+                    // Also try dispatching a proper click event
+                    el.dispatchEvent(new MouseEvent('click', {bubbles: true}));
+                    return txt;
+                }
+            }
+            // Try the action button container in nav-bottom-left
+            const container = document.querySelector('.nav-bottom-left .action-button-sub-container');
+            if (container) {
+                container.dispatchEvent(new MouseEvent('click', {bubbles: true}));
+                return 'container-dispatch';
+            }
+            return null;
+        }""")
+        if result:
+            open_bets_clicked = True
+            print(f"  \U0001f4cb Open Bets clicked (JS: {result})")
+            await asyncio.sleep(2)
+
+    if not open_bets_clicked:
+        print("  \u26a0\ufe0f  Open Bets not found")
+
+    # Now Kick Off should appear (bottom right)
     await asyncio.sleep(1)
     if await click_kick_off(page):
         print("  \u26bd Kick Off!")
