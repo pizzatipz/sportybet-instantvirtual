@@ -945,13 +945,61 @@ async def select_over_under(page, line: float = 2.5, over: bool = True) -> bool:
         return False
 
 
-async def place_steady_bet(page, category: str, home: str, away: str) -> list[str]:
-    """
-    Place Steady strategy bets on a single fixture.
-    Italy/England -> Draw/Draw | Germany/Champions -> Over 2.5
-    """
-    bets_placed = []
+async def dismiss_dialogs(page) -> bool:
+    """Dismiss any modal dialogs/overlays blocking the page.
 
+    SportyBet sometimes shows promo popups, session warnings, or
+    other modal dialogs with class 'es-dialog-wrap' that intercept
+    all pointer events.
+    """
+    try:
+        dismissed = await page.evaluate(r"""() => {
+            let dismissed = 0;
+            // Close es-dialog overlays
+            const dialogs = document.querySelectorAll('.es-dialog-wrap, [id^="esDialog"]');
+            for (const d of dialogs) {
+                d.style.display = 'none';
+                dismissed++;
+            }
+            // Close any mask/layout overlays
+            const masks = document.querySelectorAll('.layout.mask');
+            for (const m of masks) {
+                m.style.display = 'none';
+                dismissed++;
+            }
+            // Click any close buttons in dialogs
+            const closeBtns = document.querySelectorAll('.es-dialog-wrap .close, .es-dialog-wrap .m-close');
+            for (const btn of closeBtns) {
+                btn.click();
+                dismissed++;
+            }
+            return dismissed;
+        }""")
+        if dismissed:
+            print(f"    Dismissed {dismissed} dialog(s)")
+            await asyncio.sleep(0.5)
+        return dismissed > 0
+    except Exception:
+        return False
+
+
+async def place_steady_bet(page, category: str, home: str, away: str,
+                           market_config=None, conn=None, round_id=None,
+                           stake: float = 10.0, bet_override=None) -> dict:
+    """
+    Place a Steady strategy bet on a single fixture.
+
+    If bet_override is provided, uses its market/selection directly.
+    Otherwise falls back to market_config or category heuristic.
+
+    Returns dict with bet details or empty dict if bet was not placed.
+    """
+    result = {}
+
+    # Dismiss any blocking dialogs first
+    await dismiss_dialogs(page)
+
+    # Click fixture to open detail page
     clicked = await page.evaluate(r"""(args) => {
         const [home, away] = args;
         const cells = document.querySelectorAll('.event-list .teams-cell, .teams-info-wrap');
@@ -967,27 +1015,155 @@ async def place_steady_bet(page, category: str, home: str, away: str) -> list[st
     }""", [home, away])
 
     if not clicked:
-        return bets_placed
+        return result
     await asyncio.sleep(1.5)
+
+    # Dismiss dialogs again after navigation
+    await dismiss_dialogs(page)
 
     detail = await page.query_selector("span[data-op='event_detail__market']")
     if not detail:
         await go_back_to_betting(page)
-        return bets_placed
+        return result
 
-    if category in ('Italy', 'England'):
+    # Determine market type from config, or fall back to category heuristic
+    if bet_override:
+        # Direct mode: we already know what to bet from odds scanning
+        ui_sel = bet_override.get('selection', 'Draw/ Draw')
+        ui_market = bet_override.get('market', 'HT/FT')
+        db_market = bet_override.get('db_market', 'HT/FT')
+        db_selection = bet_override.get('db_selection', 'Draw/Draw')
+        offered_odds = bet_override.get('odds', 0)
+
+        bet_placed = False
+        if ui_market == 'O/U' and 'over' in ui_sel.lower():
+            bet_placed = await select_over_under(page, line=2.5, over=True)
+        elif ui_market == 'O/U' and 'under' in ui_sel.lower():
+            bet_placed = await select_over_under(page, line=2.5, over=False)
+        elif ui_market == 'HT/FT':
+            bet_placed = await select_htft_outcome(page, ui_sel)
+
+        if bet_placed:
+            await asyncio.sleep(1)
+            if await click_place_bet(page):
+                if await click_confirm(page):
+                    result = {
+                        'market': ui_market,
+                        'db_market': db_market,
+                        'selection': db_selection,
+                        'odds': offered_odds,
+                        'category': category,
+                        'home_team': home,
+                        'away_team': away,
+                        'stake': stake,
+                    }
+
+        # Log and navigate back
+        if result and conn:
+            from src.strategies import log_bet as _log_bet
+            try:
+                _log_bet(conn, None, category, home, away,
+                         result['db_market'], result['selection'],
+                         result['odds'], result['stake'])
+            except Exception:
+                pass
+
+        await go_back_to_betting(page)
+        await asyncio.sleep(1)
+        for _ in range(5):
+            has_tabs = await page.query_selector("li.sport-type-item[data-op='iv-league-tabs']")
+            if has_tabs:
+                break
+            await go_back_to_betting(page)
+            await asyncio.sleep(1)
+        return result
+
+    elif market_config:
+        market_type = market_config.market
+        min_odds = market_config.min_odds
+    else:
+        # Legacy fallback (no config available)
+        if category in ('Italy', 'England'):
+            market_type = 'DD'
+            min_odds = 4.0
+        elif category in ('Germany', 'Champions'):
+            market_type = 'O2.5'
+            min_odds = 2.4
+        else:
+            market_type = 'O2.5'
+            min_odds = 2.5
+
+    offered_odds = None
+
+    if market_type == 'DD':
+        # Scrape DD odds from the detail page
+        odds_data = await scrape_htft_odds_from_detail(page)
+        if odds_data and 'draw_draw' in odds_data:
+            offered_odds = odds_data['draw_draw']
+            print(f"    DD odds: {offered_odds} (need >= {min_odds})")
+
+        # Check minimum odds threshold
+        if offered_odds is not None and offered_odds < min_odds:
+            print(f"    Skip: odds {offered_odds} < {min_odds}")
+            await go_back_to_betting(page)
+            return result
+
         if await select_htft_outcome(page, "Draw/ Draw"):
             await asyncio.sleep(1)
             if await click_place_bet(page):
                 if await click_confirm(page):
-                    bets_placed.append("DD")
-    elif category in ('Germany', 'Champions'):
+                    result = {
+                        'market': 'DD',
+                        'db_market': 'HT/FT',
+                        'selection': 'Draw/Draw',
+                        'odds': offered_odds or 0.0,
+                        'category': category,
+                        'home_team': home,
+                        'away_team': away,
+                        'stake': stake,
+                    }
+
+    elif market_type == 'O2.5':
+        # Scrape O/U odds from the detail page
+        offered_odds = await scrape_over_under_odds(page, line=2.5)
+        if offered_odds is not None:
+            print(f"    O2.5 odds: {offered_odds} (need >= {min_odds})")
+
+        # Check minimum odds threshold
+        if offered_odds is not None and offered_odds < min_odds:
+            print(f"    Skip: odds {offered_odds} < {min_odds}")
+            await go_back_to_betting(page)
+            return result
+
         if await select_over_under(page, line=2.5, over=True):
             await asyncio.sleep(1)
             if await click_place_bet(page):
                 if await click_confirm(page):
-                    bets_placed.append("O2.5")
+                    result = {
+                        'market': 'O2.5',
+                        'db_market': 'O/U',
+                        'selection': 'Over 2.5',
+                        'odds': offered_odds or 0.0,
+                        'category': category,
+                        'home_team': home,
+                        'away_team': away,
+                        'stake': stake,
+                    }
 
+    # Log bet to database (round_id=None since round hasn't been inserted yet;
+    # will be updated during settlement when the real round_id is known)
+    if result and conn:
+        from src.strategies import log_bet
+        try:
+            log_bet(
+                conn, None, category, home, away,
+                result['db_market'], result['selection'],
+                result['odds'], result['stake'],
+            )
+        except Exception as e:
+            print(f"    Bet log error: {e}")
+
+    # Navigate back to betting list
     await go_back_to_betting(page)
     await asyncio.sleep(1)
     for _ in range(5):
@@ -997,7 +1173,214 @@ async def place_steady_bet(page, category: str, home: str, away: str) -> list[st
         await go_back_to_betting(page)
         await asyncio.sleep(1)
 
-    return bets_placed
+    return result
+
+
+async def scrape_over_under_odds(page, line: float = 2.5) -> float | None:
+    """Scrape the Over odds for a specific line from the match detail page.
+
+    Returns the Over odds as a float, or None if not found.
+    """
+    try:
+        odds = await page.evaluate(r"""(targetLine) => {
+            const headers = document.querySelectorAll('span[data-op="event_detail__market"]');
+            let market = null;
+            for (const h of headers) {
+                const txt = (h.textContent || '').trim();
+                if (txt === 'O/U' || txt === 'Over/Under') {
+                    market = h.closest('.market');
+                    break;
+                }
+            }
+            if (!market) return null;
+
+            const rows = market.querySelectorAll('.specifier-row');
+            for (const row of rows) {
+                const lineEl = row.querySelector('.specifier-column-title em');
+                if (!lineEl) continue;
+                if ((lineEl.textContent || '').trim() === String(targetLine)) {
+                    const outcomes = row.querySelectorAll('.iw-outcome:not(.specifier-column-title)');
+                    if (outcomes.length > 0) {
+                        // Over is the first outcome
+                        const ems = outcomes[0].querySelectorAll('em');
+                        if (ems.length > 0) {
+                            const val = parseFloat((ems[ems.length - 1].textContent || '').trim());
+                            return isNaN(val) ? null : val;
+                        }
+                    }
+                }
+            }
+            return null;
+        }""", line)
+        return odds
+    except Exception:
+        return None
+
+
+async def scrape_all_market_odds(page) -> dict:
+    """Scrape ALL available market odds from a match detail page.
+
+    Returns a dict with:
+    - 'ou': {0.5: (over, under), 1.5: ..., 2.5: ..., 3.5: ..., 4.5: ..., 5.5: ...}
+    - 'htft': {home_home: odds, draw_draw: odds, ...}
+    - '1x2': {home: odds, draw: odds, away: odds}  (if visible on detail)
+    """
+    result = {}
+
+    try:
+        data = await page.evaluate(r"""() => {
+            const out = { ou: {}, htft: {}, onextwox: {} };
+
+            // ── O/U Market ──────────────────────────
+            const headers = document.querySelectorAll('span[data-op="event_detail__market"]');
+            for (const h of headers) {
+                const txt = (h.textContent || '').trim();
+
+                if (txt === 'O/U' || txt === 'Over/Under') {
+                    const market = h.closest('.market');
+                    if (!market) continue;
+                    const rows = market.querySelectorAll('.specifier-row');
+                    for (const row of rows) {
+                        const lineEl = row.querySelector('.specifier-column-title em');
+                        if (!lineEl) continue;
+                        const line = (lineEl.textContent || '').trim();
+                        const outcomes = row.querySelectorAll('.iw-outcome:not(.specifier-column-title)');
+                        if (outcomes.length >= 2) {
+                            const overEms = outcomes[0].querySelectorAll('em');
+                            const underEms = outcomes[1].querySelectorAll('em');
+                            const overVal = overEms.length > 0
+                                ? parseFloat((overEms[overEms.length-1].textContent||'').trim()) : null;
+                            const underVal = underEms.length > 0
+                                ? parseFloat((underEms[underEms.length-1].textContent||'').trim()) : null;
+                            out.ou[line] = [overVal, underVal];
+                        }
+                    }
+                }
+
+                // ── HT/FT Market ──────────────────────
+                if (txt.match(/^HT\s*\/\s*FT/i)) {
+                    const market = h.closest('.market');
+                    if (!market) continue;
+                    const outcomes = market.querySelectorAll('.iw-outcome');
+                    for (const oc of outcomes) {
+                        const ems = oc.querySelectorAll('em');
+                        if (ems.length >= 2) {
+                            const label = (ems[0].textContent || '').trim();
+                            const val = parseFloat((ems[1].textContent || '').trim());
+                            if (!isNaN(val)) out.htft[label] = val;
+                        }
+                    }
+                }
+
+                // ── 1X2 Market ──────────────────────
+                if (txt === '1X2' || txt === '1x2') {
+                    const market = h.closest('.market');
+                    if (!market) continue;
+                    const outcomes = market.querySelectorAll('.iw-outcome');
+                    const vals = [];
+                    for (const oc of outcomes) {
+                        const ems = oc.querySelectorAll('em');
+                        if (ems.length >= 2) {
+                            const val = parseFloat((ems[ems.length-1].textContent || '').trim());
+                            if (!isNaN(val)) vals.push(val);
+                        }
+                    }
+                    if (vals.length >= 3) {
+                        out.onextwox = { home: vals[0], draw: vals[1], away: vals[2] };
+                    }
+                }
+            }
+            return out;
+        }""")
+
+        if data:
+            result = data
+    except Exception:
+        pass
+
+    return result
+
+
+async def scrape_odds_for_round(page, fixtures: list[dict]) -> list[dict]:
+    """Open each fixture and scrape all market odds.
+
+    Iterates through every fixture on the betting screen, opens the
+    detail page, scrapes O/U + HT/FT + 1X2 odds, then navigates back.
+
+    Returns list of dicts with fixture info + all odds.
+    """
+    results = []
+
+    for fix_idx, fixture in enumerate(fixtures):
+        cat = fixture.get('category', '')
+        home = fixture.get('home_team', '')
+        away = fixture.get('away_team', '')
+
+        # Dismiss dialogs
+        await dismiss_dialogs(page)
+
+        # Click fixture
+        clicked = await page.evaluate(r"""(args) => {
+            const [home, away] = args;
+            const cells = document.querySelectorAll('.event-list .teams-cell, .teams-info-wrap');
+            for (const cell of cells) {
+                const txt = cell.textContent || '';
+                if (txt.includes(home) && txt.includes(away)) {
+                    cell.scrollIntoView({ behavior: 'instant', block: 'center' });
+                    cell.click();
+                    return true;
+                }
+            }
+            return false;
+        }""", [home, away])
+
+        if not clicked:
+            continue
+        await asyncio.sleep(1.2)
+
+        # Dismiss dialogs after nav
+        await dismiss_dialogs(page)
+
+        # Check we're on detail page
+        detail = await page.query_selector("span[data-op='event_detail__market']")
+        if not detail:
+            await go_back_to_betting(page)
+            continue
+
+        # Scrape all odds
+        try:
+            all_odds = await scrape_all_market_odds(page)
+        except Exception:
+            all_odds = {}
+
+        # Build record
+        record = {
+            'category': cat,
+            'home_team': home,
+            'away_team': away,
+            'odds_1x2': all_odds.get('onextwox', {}),
+            'odds_ou': all_odds.get('ou', {}),
+            'odds_htft': all_odds.get('htft', {}),
+        }
+        results.append(record)
+
+        # Go back
+        await go_back_to_betting(page)
+        await asyncio.sleep(0.8)
+
+        # Make sure we're back on the list
+        for _ in range(3):
+            has_tabs = await page.query_selector("li.sport-type-item[data-op='iv-league-tabs']")
+            if has_tabs:
+                break
+            await go_back_to_betting(page)
+            await asyncio.sleep(0.8)
+
+        # Progress
+        if (fix_idx + 1) % 10 == 0:
+            print(f"    Scraped {fix_idx + 1}/{len(fixtures)} fixtures...")
+
+    return results
 
 
 async def click_betslip(page) -> bool:
@@ -1679,17 +2062,39 @@ async def run_scraper(rounds: int = 0, headless: bool = False, manual: bool = Fa
         consecutive_errors = 0
 
         # Initial strategy learning from existing data
-        print("\n  📚 Loading strategy from historical data...")
-        report = learn_from_data(conn)
-        print_learning_report(report)
+        if steady_mode:
+            from src.strategies import (
+                learn_from_data as steady_learn, print_strategy_report,
+                compute_pairing_stats, evaluate_fixture,
+                settle_bets, SteadyState,
+                LEARN_INTERVAL as STEADY_LEARN_INTERVAL,
+                print_performance_report, MAX_BETS_PER_ROUND,
+                log_bet,
+            )
+            print("\n  Loading Steady v2 strategy (pairing-based)...")
+            strategy_report = steady_learn(conn)
+            print_strategy_report(strategy_report)
+            pairing_stats = strategy_report.get('pairing_stats', {})
+            steady_state = SteadyState()
+        else:
+            print("\n  Loading strategy from historical data...")
+            report = learn_from_data(conn)
+            print_learning_report(report)
 
         rounds_scraped = 0
         while rounds == 0 or rounds_scraped < rounds:
             # ── Periodic re-learning ─────────────────────────────
             if rounds_scraped > 0 and rounds_scraped % LEARN_INTERVAL == 0:
-                print("\n  📚 Re-learning strategy from updated data...")
-                report = learn_from_data(conn)
-                print_learning_report(report)
+                if steady_mode:
+                    print("\n  Re-learning pairing stats...")
+                    strategy_report = steady_learn(conn)
+                    print_strategy_report(strategy_report)
+                    pairing_stats = strategy_report.get('pairing_stats', {})
+                    print_performance_report(steady_state)
+                else:
+                    print("\n  Re-learning strategy from updated data...")
+                    report = learn_from_data(conn)
+                    print_learning_report(report)
 
             print(f"\n{'─' * 50}")
             print(f"Round cycle #{rounds_scraped + 1}")
@@ -1718,6 +2123,9 @@ async def run_scraper(rounds: int = 0, headless: bool = False, manual: bool = Fa
             # ── BETTING screen: place bet + start round ─────────
             if screen == "betting":
                 round_id, fixtures = await scrape_betting_screen(target)
+                # Generate a temporary round_id if URL didn't provide one
+                if not round_id:
+                    round_id = f"R{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
                 if fixtures:
                     print(f"📋 Pre-match: {len(fixtures)} fixtures scraped")
                     for f in fixtures[:3]:
@@ -1733,27 +2141,23 @@ async def run_scraper(rounds: int = 0, headless: bool = False, manual: bool = Fa
                             target, fixtures, selection="Away/ Home"
                         )
                     elif steady_mode:
-                        # Steady strategy: Draw/Draw + Over 2.5
+                        # Steady v2: pairing-based value betting
+                        # Scrape odds for each fixture, evaluate EV per pairing
                         from collections import defaultdict as _dd2
-                        steady_cats = {'Italy': [], 'England': [], 'Germany': [], 'Champions': []}
+                        by_cat = _dd2(list)
                         for f in fixtures:
-                            if f['category'] in steady_cats:
-                                steady_cats[f['category']].append(f)
+                            by_cat[f['category']].append(f)
 
-                        total_steady = sum(len(v) for v in steady_cats.values())
-                        print(f"\n  📈 Steady strategy: {total_steady} fixtures")
-                        for cat, fxs in steady_cats.items():
-                            if fxs:
-                                mkt = "DD" if cat in ('Italy', 'England') else "O2.5"
-                                print(f"     {cat} ({mkt}): {len(fxs)} fixtures")
+                        print(f"\n  Steady v2: scanning {len(fixtures)} fixtures for +EV bets")
 
-                        steady_bets = 0
-                        for cat in ['Italy', 'England', 'Germany', 'Champions']:
-                            if not steady_cats[cat]:
-                                continue
+                        all_opportunities = []  # (ev, fixture_dict, bet_info)
+                        steady_state.start_round()
 
+                        for cat in sorted(by_cat.keys()):
+                            cat_fixtures = by_cat[cat]
                             # Click category tab
-                            await page.evaluate(r"""(catName) => {
+                            await dismiss_dialogs(target)
+                            await target.evaluate(r"""(catName) => {
                                 const tabs = document.querySelectorAll('li.sport-type-item');
                                 for (const tab of tabs) {
                                     if ((tab.textContent || '').trim() === catName) {
@@ -1764,25 +2168,152 @@ async def run_scraper(rounds: int = 0, headless: bool = False, manual: bool = Fa
                             }""", cat)
                             await asyncio.sleep(0.8)
 
-                            for f in steady_cats[cat]:
+                            for f in cat_fixtures:
                                 home = f['home_team']
                                 away = f['away_team']
-                                mkt = "DD" if cat in ('Italy', 'England') else "O2.5"
-                                print(f"\n  📌 {home} vs {away} ({cat}) [{mkt}]")
+                                await dismiss_dialogs(target)
 
-                                placed = await place_steady_bet(target, cat, home, away)
-                                if placed:
-                                    steady_bets += len(placed)
-                                    print(f"    ✅ {', '.join(placed)} confirmed!")
-                                else:
-                                    print(f"    ⚠️  Could not place bet")
+                                # Click fixture to open detail
+                                try:
+                                    clicked = await target.evaluate(r"""(args) => {
+                                        const [home, away] = args;
+                                        const cells = document.querySelectorAll(
+                                            '.event-list .teams-cell, .teams-info-wrap'
+                                        );
+                                        for (const cell of cells) {
+                                            const txt = cell.textContent || '';
+                                            if (txt.includes(home) && txt.includes(away)) {
+                                                cell.scrollIntoView({behavior:'instant',block:'center'});
+                                                cell.click();
+                                                return true;
+                                            }
+                                        }
+                                        return false;
+                                    }""", [home, away])
+                                except Exception:
+                                    clicked = False
 
-                                if steady_bets >= 30:
-                                    break
-                            if steady_bets >= 30:
+                                if not clicked:
+                                    continue
+                                await asyncio.sleep(1.2)
+                                await dismiss_dialogs(target)
+
+                                detail = await target.query_selector(
+                                    "span[data-op='event_detail__market']"
+                                )
+                                if not detail:
+                                    await go_back_to_betting(target)
+                                    await asyncio.sleep(0.5)
+                                    continue
+
+                                # Scrape all odds
+                                try:
+                                    all_odds = await scrape_all_market_odds(target)
+                                except Exception:
+                                    all_odds = {}
+
+                                ou = all_odds.get('ou', {})
+                                htft = all_odds.get('htft', {})
+                                line25 = ou.get('2.5', [None, None])
+                                odds_o25 = line25[0] if line25 and len(line25) > 0 else None
+                                odds_u25 = line25[1] if line25 and len(line25) > 1 else None
+                                odds_dd = htft.get('Draw/ Draw') or htft.get('X/X')
+
+                                # Evaluate using pairing stats
+                                opps = evaluate_fixture(
+                                    cat, home, away,
+                                    odds_o25, odds_u25, odds_dd,
+                                    pairing_stats,
+                                )
+
+                                if opps:
+                                    best = opps[0]
+                                    all_opportunities.append((best['ev'], f, best))
+                                    info = f"O2.5={odds_o25} U2.5={odds_u25} DD={odds_dd}"
+                                    print(f"    {home}v{away} ({cat}): {info} -> "
+                                          f"{best['selection']}@{best['odds']:.2f} EV={best['ev']*100:+.0f}%")
+
+                                # Go back
+                                await go_back_to_betting(target)
+                                await asyncio.sleep(0.6)
+                                for _ in range(3):
+                                    has_tabs = await target.query_selector(
+                                        "li.sport-type-item[data-op='iv-league-tabs']"
+                                    )
+                                    if has_tabs:
+                                        break
+                                    await go_back_to_betting(target)
+                                    await asyncio.sleep(0.5)
+
+                        # Sort by EV and take top 30
+                        all_opportunities.sort(key=lambda x: x[0], reverse=True)
+                        to_bet = all_opportunities[:MAX_BETS_PER_ROUND]
+                        print(f"\n  Found {len(all_opportunities)} +EV opportunities, "
+                              f"betting on top {len(to_bet)}")
+
+                        # Now place bets
+                        steady_bets = 0
+                        for ev_val, fix, bet_info in to_bet:
+                            cat = fix['category']
+                            home = fix['home_team']
+                            away = fix['away_team']
+                            sel = bet_info['selection']
+                            odds_val = bet_info['odds']
+                            mkt = bet_info['market']
+
+                            # Navigate to category
+                            await dismiss_dialogs(target)
+                            await target.evaluate(r"""(catName) => {
+                                const tabs = document.querySelectorAll('li.sport-type-item');
+                                for (const tab of tabs) {
+                                    if ((tab.textContent || '').trim() === catName) {
+                                        tab.click(); return true;
+                                    }
+                                }
+                                return false;
+                            }""", cat)
+                            await asyncio.sleep(0.6)
+
+                            try:
+                                bet_result = await place_steady_bet(
+                                    target, cat, home, away,
+                                    market_config=None, conn=conn,
+                                    round_id=round_id, stake=10.0,
+                                    bet_override={'market': bet_info['ui_market'],
+                                                  'selection': bet_info['ui_selection'],
+                                                  'min_odds': 0,
+                                                  'db_market': mkt,
+                                                  'db_selection': sel,
+                                                  'odds': odds_val},
+                                )
+                            except Exception as e:
+                                print(f"    Error: {e}")
+                                await dismiss_dialogs(target)
+                                await go_back_to_betting(target)
+                                await asyncio.sleep(1)
+                                bet_result = {}
+
+                            if bet_result:
+                                steady_bets += 1
+                                print(f"    {sel} {home}v{away} @{odds_val:.2f} "
+                                      f"EV={ev_val*100:+.0f}% CONFIRMED")
+
+                            if steady_bets >= MAX_BETS_PER_ROUND:
                                 break
 
-                        print(f"\n  💰 {steady_bets} steady bets placed")
+                        print(f"\n  {steady_bets} bets placed this round")
+
+                        if steady_bets == 0:
+                            print("  No bets placed. Observing...")
+                            if await open_fixture_detail(target, 0):
+                                await select_htft_outcome(target, "Away/ Home")
+                                await asyncio.sleep(1)
+                                if await click_place_bet(target):
+                                    await click_confirm(target)
+                                await go_back_to_betting(target)
+                                await asyncio.sleep(1)
+
+                        await dismiss_dialogs(target)
 
                         # Open Bets → Kick Off → Skip
                         await asyncio.sleep(1)
@@ -1794,16 +2325,20 @@ async def run_scraper(rounds: int = 0, headless: bool = False, manual: bool = Fa
                         ]:
                             btn = await target.query_selector(selector)
                             if btn:
-                                await btn.click(force=True)
-                                print("  📋 Open Bets clicked")
-                                await asyncio.sleep(2)
-                                break
+                                try:
+                                    await btn.click(force=True)
+                                    print("  Open Bets clicked")
+                                    await asyncio.sleep(2)
+                                    break
+                                except Exception:
+                                    await dismiss_dialogs(target)
+                                    continue
 
                         if await click_kick_off(target):
-                            print("  ⚽ Kick Off!")
+                            print("  Kick Off!")
                         await asyncio.sleep(3)
                         if await click_skip_to_result(target):
-                            print("  ⏭️  Skipped to result")
+                            print("  Skipped to result")
                     else:
                         # Observe mode — place 1 bet to trigger the full flow
                         # (SportyBet requires a bet to show results)
@@ -1913,6 +2448,24 @@ async def run_scraper(rounds: int = 0, headless: bool = False, manual: bool = Fa
 
                     print(f"✅ Round {round_id} | {count} matches stored | {jackpots} jackpot(s)")
 
+                    # Settle bets if in steady mode
+                    if steady_mode and round_id:
+                        # Assign round_id to any pending (unsettled) bets
+                        conn.execute(
+                            "UPDATE bets SET round_id = ? WHERE won IS NULL",
+                            (round_id,),
+                        )
+                        conn.commit()
+                        settlement = settle_bets(conn, round_id, matches)
+                        if settlement['settled'] > 0:
+                            print(f"   Settled: {settlement['settled']} bets, "
+                                  f"{settlement['wins']} wins, "
+                                  f"P&L: NGN {settlement['profit']:+.0f}")
+                            steady_state.end_round()
+                        elif steady_state.round_bets_count > 0:
+                            print(f"   Warning: {steady_state.round_bets_count} bets pending, couldn't match to results")
+                            steady_state.end_round()
+
                     stats = get_total_stats(conn)
                     print(f"   📊 Total: {stats['total_rounds']} rounds, "
                           f"{stats['total_matches']} matches, "
@@ -1960,6 +2513,18 @@ async def run_scraper(rounds: int = 0, headless: bool = False, manual: bool = Fa
         print(f"  Matches: {stats['total_matches']}")
         print(f"  Jackpots (Away/Home): {stats['total_jackpots']}")
         print(f"  Jackpot rate: {stats['jackpot_rate']:.2%}")
+
+        if steady_mode:
+            print_performance_report(steady_state)
+            # Also show DB-verified stats
+            from src.strategies import get_session_stats
+            db_stats = get_session_stats(conn)
+            if db_stats['total_bets'] > 0:
+                print(f"  DB-verified: {db_stats['total_bets']} bets, "
+                      f"{db_stats['wins']} wins, "
+                      f"NGN {db_stats['total_profit']:+.0f} profit, "
+                      f"ROI {db_stats['roi']:+.1f}%")
+
         print(f"{'=' * 50}\n")
 
         conn.close()
@@ -2363,10 +2928,16 @@ def main():
         "--inspect", action="store_true",
         help="Launch browser in inspect mode to examine page DOM"
     )
+    parser.add_argument(
+        "--scrape-odds", action="store_true", dest="scrape_odds",
+        help="Scrape all market odds for every fixture (no betting)"
+    )
     args = parser.parse_args()
 
     if args.inspect:
         asyncio.run(_inspect_mode())
+    elif args.scrape_odds:
+        asyncio.run(run_odds_scraper(rounds=args.rounds))
     else:
         asyncio.run(run_scraper(
             rounds=args.rounds,
@@ -2375,6 +2946,247 @@ def main():
             place_bets=args.bet,
             steady_mode=args.steady,
         ))
+
+
+async def run_odds_scraper(rounds: int = 1) -> None:
+    """Dedicated odds-scraping mode.
+
+    Opens every fixture on the betting screen and scrapes all O/U, HT/FT,
+    and 1X2 odds. Stores results to a JSON file for analysis.
+    Does NOT place any bets — purely data collection.
+    """
+    import json
+
+    pw, context, page = await launch_browser(headless=False)
+    data_dir = Path(__file__).parent.parent / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    all_rounds_data = []
+
+    try:
+        target = await wait_for_login(page)
+
+        rounds_done = 0
+        while rounds == 0 or rounds_done < rounds:
+            print(f"\n{'─' * 50}")
+            print(f"Odds scrape round #{rounds_done + 1}")
+
+            # Check session
+            try:
+                session_ok = await check_session_alive(page, target)
+            except Exception:
+                session_ok = False
+            if not session_ok:
+                if not await handle_session_expired(page):
+                    break
+                target = await recover_iframe(page)
+                continue
+
+            screen = await detect_screen(target)
+            print(f"Screen: {screen}")
+
+            if screen == "betting":
+                round_id, fixtures = await scrape_betting_screen(target)
+                if not fixtures:
+                    print("  No fixtures found.")
+                    await asyncio.sleep(5)
+                    continue
+
+                print(f"  {len(fixtures)} fixtures on betting screen")
+
+                # Group by category for tab navigation
+                from collections import defaultdict
+                by_cat = defaultdict(list)
+                for f in fixtures:
+                    by_cat[f['category']].append(f)
+
+                round_data = {
+                    'round_id': round_id or f"R{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}",
+                    'timestamp': datetime.now(timezone.utc).isoformat(),
+                    'fixtures': [],
+                }
+
+                for cat in sorted(by_cat.keys()):
+                    cat_fixtures = by_cat[cat]
+                    print(f"\n  {cat} ({len(cat_fixtures)} fixtures):")
+
+                    # Click category tab
+                    await dismiss_dialogs(target)
+                    await target.evaluate(r"""(catName) => {
+                        const tabs = document.querySelectorAll('li.sport-type-item');
+                        for (const tab of tabs) {
+                            if ((tab.textContent || '').trim() === catName) {
+                                tab.click(); return true;
+                            }
+                        }
+                        return false;
+                    }""", cat)
+                    await asyncio.sleep(0.8)
+
+                    for f in cat_fixtures:
+                        home = f['home_team']
+                        away = f['away_team']
+
+                        await dismiss_dialogs(target)
+
+                        # Click fixture
+                        clicked = await target.evaluate(r"""(args) => {
+                            const [home, away] = args;
+                            const cells = document.querySelectorAll(
+                                '.event-list .teams-cell, .teams-info-wrap'
+                            );
+                            for (const cell of cells) {
+                                const txt = cell.textContent || '';
+                                if (txt.includes(home) && txt.includes(away)) {
+                                    cell.scrollIntoView({behavior:'instant', block:'center'});
+                                    cell.click();
+                                    return true;
+                                }
+                            }
+                            return false;
+                        }""", [home, away])
+
+                        if not clicked:
+                            print(f"    {home} vs {away}: SKIP (not found)")
+                            continue
+                        await asyncio.sleep(1.2)
+                        await dismiss_dialogs(target)
+
+                        detail = await target.query_selector(
+                            "span[data-op='event_detail__market']"
+                        )
+                        if not detail:
+                            print(f"    {home} vs {away}: SKIP (no detail)")
+                            await go_back_to_betting(target)
+                            await asyncio.sleep(0.5)
+                            continue
+
+                        try:
+                            all_odds = await scrape_all_market_odds(target)
+                        except Exception:
+                            all_odds = {}
+
+                        # Extract key values for display
+                        ou = all_odds.get('ou', {})
+                        htft = all_odds.get('htft', {})
+                        o25 = ou.get('2.5', [None, None])
+                        u25 = o25[1] if o25 and len(o25) > 1 else None
+                        o25v = o25[0] if o25 else None
+                        dd_odds = htft.get('Draw/ Draw', htft.get('X/X', None))
+
+                        record = {
+                            'category': cat,
+                            'home_team': home,
+                            'away_team': away,
+                            'odds_1': f.get('odds_1'),
+                            'odds_x': f.get('odds_x'),
+                            'odds_2': f.get('odds_2'),
+                            'ou': {k: v for k, v in ou.items()},
+                            'htft': {k: v for k, v in htft.items()},
+                        }
+                        round_data['fixtures'].append(record)
+
+                        # Compact display
+                        parts = []
+                        if o25v is not None:
+                            parts.append(f"O2.5={o25v}")
+                        if u25 is not None:
+                            parts.append(f"U2.5={u25}")
+                        if dd_odds is not None:
+                            parts.append(f"DD={dd_odds}")
+                        display = "  ".join(parts) if parts else "no odds"
+                        print(f"    {home} vs {away}: {display}")
+
+                        # Navigate back
+                        await go_back_to_betting(target)
+                        await asyncio.sleep(0.6)
+                        for _ in range(3):
+                            has_tabs = await target.query_selector(
+                                "li.sport-type-item[data-op='iv-league-tabs']"
+                            )
+                            if has_tabs:
+                                break
+                            await go_back_to_betting(target)
+                            await asyncio.sleep(0.6)
+
+                all_rounds_data.append(round_data)
+                n_fixtures = len(round_data['fixtures'])
+                print(f"\n  Round complete: {n_fixtures} fixtures scraped")
+
+                # Save after each round
+                out_path = data_dir / "scraped_odds.json"
+                with open(out_path, 'w') as fp:
+                    json.dump(all_rounds_data, fp, indent=2)
+                print(f"  Saved to {out_path}")
+
+                rounds_done += 1
+
+                # Also advance the round so we can scrape different fixtures
+                if rounds == 0 or rounds_done < rounds:
+                    # Place 1 throw-away bet to trigger round progression
+                    if await open_fixture_detail(target, 0):
+                        await select_htft_outcome(target, "Away/ Home")
+                        await asyncio.sleep(0.5)
+                        if await click_place_bet(target):
+                            await click_confirm(target)
+                        await go_back_to_betting(target)
+                        await asyncio.sleep(1)
+
+                    for sel in [
+                        "[data-op='iv-main-open-bets']",
+                        ".nav-bottom-left .action-button-sub-container",
+                        ".nav-bottom-left",
+                    ]:
+                        btn = await target.query_selector(sel)
+                        if btn:
+                            try:
+                                await btn.click(force=True)
+                                await asyncio.sleep(2)
+                                break
+                            except Exception:
+                                continue
+
+                    if await click_kick_off(target):
+                        print("  Kick Off!")
+                    await asyncio.sleep(3)
+                    if await click_skip_to_result(target):
+                        print("  Skipped to result")
+                    await asyncio.sleep(2)
+                    if await wait_for_results(target, timeout_s=120):
+                        pass
+                    if await click_next_round(target):
+                        print("  Next Round!")
+                    await asyncio.sleep(3)
+                    target = await recover_iframe(page)
+
+            elif screen == "results":
+                if await click_next_round(target):
+                    await asyncio.sleep(3)
+                target = await recover_iframe(page)
+            elif screen == "live":
+                await wait_for_results(target, timeout_s=120)
+                await asyncio.sleep(2)
+                if await click_next_round(target):
+                    await asyncio.sleep(3)
+                target = await recover_iframe(page)
+            else:
+                await asyncio.sleep(5)
+                target = await recover_iframe(page)
+
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    except Exception as e:
+        print(f"\nError: {e}")
+    finally:
+        # Final save
+        if all_rounds_data:
+            out_path = data_dir / "scraped_odds.json"
+            import json
+            with open(out_path, 'w') as fp:
+                json.dump(all_rounds_data, fp, indent=2)
+            print(f"\nSaved {sum(len(r['fixtures']) for r in all_rounds_data)} fixtures to {out_path}")
+
+        await context.close()
+        await pw.stop()
 
 
 async def _inspect_mode():

@@ -1,100 +1,99 @@
 # SportyBet Virtual Sports RNG Study
 
-**An empirical investigation into whether AI or algorithmic pattern recognition can detect exploitable structure in virtual sports HT/FT betting outcomes — with special focus on the Away/Home jackpot (100.00 odds).**
+An empirical investigation into pattern detection and value betting in SportyBet's Instant Virtual Soccer. Started as an academic study of RNG randomness; evolved into a working pairing-based value betting system.
 
-## Hypothesis
+## Key Findings (31,515 matches)
 
-Virtual sports on platforms like SportyBet use certified CSPRNGs (Cryptographically Secure Pseudorandom Number Generators) to determine outcomes. If correctly implemented, no polynomial-time algorithm — including deep learning models — can predict future outcomes better than the base rate. The house edge, embedded in the odds, guarantees negative expected value on every bet regardless of strategy.
-
-**This experiment tests that hypothesis with real data, focused on the HT/FT market.**
-
-## Focus: HT/FT Market & The Jackpot
-
-The Half-Time / Full-Time (HT/FT) market has 9 possible outcomes:
-
-| Selection | Meaning | Odds |
-|-----------|---------|------|
-| Home/Home | Home leads at HT, Home wins FT | Low-mid |
-| Home/Draw | Home leads at HT, Draw at FT | Mid-high |
-| Home/Away | Home leads at HT, Away wins FT | High |
-| Draw/Home | Draw at HT, Home wins FT | Mid |
-| Draw/Draw | Draw at HT, Draw at FT | Mid |
-| Draw/Away | Draw at HT, Away wins FT | Mid |
-| **Away/Home** | **Away leads at HT, Home wins FT** | **100.00** |
-| Away/Draw | Away leads at HT, Draw at FT | Mid-high |
-| Away/Away | Away leads at HT, Away wins FT | Low-mid |
-
-**Away/Home** is always priced at **100.00 odds** — the jackpot. At implied probability of 1%, we're investigating how often it actually hits and whether there are exploitable patterns.
-
-## Data Collection Strategy
-
-After each round, SportyBet displays ALL results from ALL 8 virtual leagues:
-- **England, Spain, Germany, Champions, Italy, African Cup, Euros, Club World Cup**
-
-This means every round gives us 40+ data points for free — no betting required. We scrape these results to build a large dataset rapidly.
+- The RNG produces **statistically significant biases** across categories (e.g., Italy avg 1.69 goals vs Germany avg 2.39)
+- The bookmaker applies a **consistent 5.0% margin** across all markets
+- The bookmaker's per-match pricing has **moderate accuracy** (correlation 0.53 with actual rates)
+- **Specific team pairings consistently deviate** from bookmaker estimates, creating +EV opportunities
+- A pairing-based strategy identifies +EV bets on **~44% of fixtures** with projected **+NGN 6,950/day** at NGN 10 stake
 
 ## Project Structure
 
 ```
 sportybet-rng-study/
-├── README.md
-├── PLAN.md                    # Full implementation plan
-├── requirements.txt           # Python dependencies
-├── src/
-│   ├── __init__.py
-│   ├── db.py                  # SQLite storage layer (HT/FT schema)
-│   ├── bot.py                 # Playwright result scraper
-│   ├── analyze.py             # HT/FT statistical analysis pipeline
-│   └── strategies.py          # Jackpot betting strategy backtester
-├── data/
-│   └── sportybet.db           # SQLite database (gitignored)
-└── reports/                   # Generated analysis reports & plots
++-- README.md                  # This file
++-- PLAN.md                    # Original implementation plan
++-- ANALYSIS.md                # Complete analysis report
++-- STEADY_STRATEGY.md         # Strategy documentation
++-- requirements.txt           # Python dependencies
++-- src/
+|   +-- __init__.py
+|   +-- __main__.py            # CLI entry point
+|   +-- bot.py                 # Playwright browser automation
+|   +-- db.py                  # SQLite storage layer
+|   +-- analyze.py             # Statistical analysis pipeline
+|   +-- strategies.py          # Pairing-based value betting engine
++-- data/
+|   +-- sportybet.db           # SQLite database (gitignored)
+|   +-- scraped_odds.json      # Real odds data from SportyBet
+|   +-- browser_profile/       # Persistent Chromium session
++-- reports/                   # Generated analysis reports
 ```
 
 ## Quick Start
 
 ```bash
-# Install dependencies
+# Install
 pip install -r requirements.txt
 playwright install chromium
 
-# Option 1: Scrape results automatically via browser
-python -m src.bot
+# Collect data (observe mode - scrape results, no betting)
+python -m src bot --rounds 100
 
-# Option 2: Enter results manually (no browser needed)
-python -m src.bot --manual
+# Scrape all market odds from fixtures
+python -m src bot --scrape-odds --rounds 3
 
-# Option 3: Inspect page DOM to fix selectors
-python -m src.bot --inspect
+# Run Steady v2 strategy (pairing-based value betting)
+python -m src bot --rounds 0 --steady
 
-# Run full HT/FT analysis
-python -m src.analyze
-
-# Jackpot-focused analysis only
-python -m src.analyze --jackpot
-
-# Backtest jackpot strategies
-python -m src.strategies
+# Run statistical analysis
+python -m src analyze
 ```
 
-## What We're Testing
+## Strategy Overview
 
-| Test | What It Detects | If Found |
-|------|----------------|----------|
-| Chi-squared goodness-of-fit | Biased HT/FT distribution | Math model has uneven weights |
-| Runs test | Non-random jackpot sequencing | Outcomes are not independent |
-| Autocorrelation (lag 1-20) | Sequential dependency in jackpots | Past results influence future ones |
-| Spectral analysis (FFT) | Periodic jackpot patterns | Cyclic structure exists |
-| Transition matrix (9×9) | Outcome memory | Previous result affects next |
-| Cross-category correlation | Shared RNG seed | Categories are not independent |
-| Strategy backtesting | Exploitable edge | A betting strategy beats the margin |
+### Steady v2: Pairing-Based Value Betting
 
-## Expected Outcome
+The system evaluates each fixture by comparing the bookmaker's offered odds against the historical win rate for that specific team pairing:
 
-The jackpot (Away/Home) should occur at approximately 1% (implied by 100.00 odds), uniformly across categories and teams, with no sequential dependency. All betting strategies should converge to negative expected value.
+1. **Pre-compute** outcome rates for every (category, home, away) pairing from 31,500+ matches
+2. **For each fixture**, scrape O2.5, U2.5, and DD odds from the detail page
+3. **Evaluate**: EV = historical_rate x offered_odds - 1
+4. **Bet only when EV > 0** and pairing has 8+ matches of history
+5. **Prioritize** by EV, cap at 30 bets per round
 
-**But we're scientists. We verify, not assume.**
+### Why It Works
+
+The bookmaker prices each match based on perceived team strength, but the virtual soccer RNG doesn't differentiate as sharply as real football. Specific pairings produce outcomes at rates that consistently diverge from the bookmaker's model — and this divergence exceeds the 5% margin.
+
+### Projected Returns
+
+| Stake | Daily (60 rounds) | Monthly |
+|-------|-------------------|---------|
+| NGN 10 | NGN ~6,950 | NGN ~208,500 |
+| NGN 50 | NGN ~34,750 | NGN ~1,042,500 |
+
+## Data Summary
+
+| Metric | Value |
+|--------|-------|
+| Matches collected | 31,515 |
+| Rounds | 355 |
+| Categories | 8 |
+| Team pairings | 3,932 (2,113 with 8+ history) |
+| Odds fixtures scraped | 231 |
+| Bookmaker margin | 5.0% |
+| Live bets placed | 41 |
+
+## Documentation
+
+- [ANALYSIS.md](ANALYSIS.md) — Complete statistical analysis with all findings
+- [STEADY_STRATEGY.md](STEADY_STRATEGY.md) — Strategy documentation, backtest results, implementation details
+- [PLAN.md](PLAN.md) — Original implementation plan
 
 ## License
 
-MIT — This is a research project, not a trading system.
+MIT — This is a research project.
