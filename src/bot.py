@@ -39,10 +39,14 @@ LEARN_INTERVAL = 10  # Re-analyze data every N rounds
 MIN_SAMPLES = 50     # Minimum matches for a team/category before trusting its rate
 CATEGORY_THRESHOLD = 1.5    # Bet on categories with jackpot rate >= this %
 TEAM_MIN_JACKPOTS = 2      # Team needs >= this many jackpots to be targeted
+MIN_ODDS = 50.0            # Only bet when Away/Home odds >= this value
 
-# Initial targets (from first 103 rounds of backtesting)
+# Categories with PROVEN negative EV — never bet here regardless of teams
+BLACKLIST_CATEGORIES = {"England", "Italy"}
+
+# Initial targets (from 328 rounds / 29,131 matches analysis)
 # These get overwritten by learn_from_data() after first interval.
-TARGET_CATEGORIES = {"Club World Cup", "African Cup", "Champions"}
+TARGET_CATEGORIES = {"Club World Cup", "Germany", "Champions"}
 TARGET_HOME_TEAMS = {
     "PSG", "ARS", "ATM", "BAY", "NEW", "ENG", "FLU", "HIL",
     "RMA", "SVK", "CIV",
@@ -86,11 +90,12 @@ def learn_from_data(conn) -> dict:
     cat_report = []
     for r in cat_rows:
         rate = r['jp'] / r['n'] * 100 if r['n'] > 0 else 0
-        qualifies = rate >= CATEGORY_THRESHOLD and r['n'] >= MIN_SAMPLES
+        blacklisted = r['category'] in BLACKLIST_CATEGORIES
+        qualifies = rate >= CATEGORY_THRESHOLD and r['n'] >= MIN_SAMPLES and not blacklisted
         cat_report.append({
             "category": r['category'], "matches": r['n'],
             "jackpots": r['jp'], "rate": round(rate, 2),
-            "targeted": qualifies,
+            "targeted": qualifies, "blacklisted": blacklisted,
         })
         if qualifies:
             new_categories.add(r['category'])
@@ -230,11 +235,19 @@ def fixture_matches_strategy(fixture: dict) -> bool:
     """Check if a fixture matches our betting strategy.
 
     A fixture qualifies if:
-    - It's in a target category, OR
-    - The home team is a known comeback team, OR
-    - The away team is a known choke team
+    1. NOT in a blacklisted category (England, Italy), AND
+    2. Either:
+       - It's in a target category, OR
+       - The home team is a known comeback team, OR
+       - The away team is a known choke team
     """
-    if fixture.get("category") in TARGET_CATEGORIES:
+    cat = fixture.get("category", "")
+    
+    # Hard exclude: never bet in negative-EV categories
+    if cat in BLACKLIST_CATEGORIES:
+        return False
+    
+    if cat in TARGET_CATEGORIES:
         return True
     if fixture.get("home_team") in TARGET_HOME_TEAMS:
         return True
@@ -1277,7 +1290,14 @@ async def place_strategic_bets(page, fixtures: list[dict], selection: str = "Awa
             # Scrape HT/FT odds
             odds = await scrape_htft_odds_from_detail(page)
             if odds:
-                print(f"    \U0001f4ca Away/Home odds: {odds.get('away_home', '?')}")
+                ah_odds = odds.get('away_home')
+                print(f"    \U0001f4ca Away/Home odds: {ah_odds}")
+                
+                # Odds filter: skip if below minimum threshold
+                if ah_odds is not None and ah_odds < MIN_ODDS:
+                    print(f"    \u26a0\ufe0f  Odds too low ({ah_odds} < {MIN_ODDS}), skipping")
+                    await go_back_to_betting(page)
+                    continue
 
             # Select outcome
             if not await select_htft_outcome(page, selection):
