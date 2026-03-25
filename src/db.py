@@ -326,3 +326,48 @@ def export_to_csv(conn: sqlite3.Connection, output_path: Path) -> None:
         writer.writeheader()
         writer.writerows(matches)
     print(f"Exported {len(matches)} matches to {output_path}")
+
+
+def insert_htft_odds(conn: sqlite3.Connection, odds_data: dict) -> int:
+    """Insert HT/FT odds for a match. Returns the row id."""
+    cursor = conn.execute(
+        """INSERT INTO htft_odds
+           (round_id, category, home_team, away_team,
+            home_home, home_draw, home_away,
+            draw_home, draw_draw, draw_away,
+            away_home, away_draw, away_away)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (odds_data.get("round_id"), odds_data.get("category"),
+         odds_data.get("home_team"), odds_data.get("away_team"),
+         odds_data.get("home_home"), odds_data.get("home_draw"),
+         odds_data.get("home_away"), odds_data.get("draw_home"),
+         odds_data.get("draw_draw"), odds_data.get("draw_away"),
+         odds_data.get("away_home"), odds_data.get("away_draw"),
+         odds_data.get("away_away")),
+    )
+    conn.commit()
+    return cursor.lastrowid
+
+
+def insert_htft_odds_bulk(conn: sqlite3.Connection, odds_list: list[dict]) -> int:
+    """Insert multiple HT/FT odds records. Returns count inserted."""
+    count = 0
+    for o in odds_list:
+        conn.execute(
+            """INSERT INTO htft_odds
+               (round_id, category, home_team, away_team,
+                home_home, home_draw, home_away,
+                draw_home, draw_draw, draw_away,
+                away_home, away_draw, away_away)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (o.get("round_id"), o.get("category"),
+             o.get("home_team"), o.get("away_team"),
+             o.get("home_home"), o.get("home_draw"),
+             o.get("home_away"), o.get("draw_home"),
+             o.get("draw_draw"), o.get("draw_away"),
+             o.get("away_home"), o.get("away_draw"),
+             o.get("away_away")),
+        )
+        count += 1
+    conn.commit()
+    return count

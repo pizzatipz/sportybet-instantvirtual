@@ -23,6 +23,7 @@ env/
 data/*.db
 data/*.sqlite
 data/*.csv
+/data/*
 
 # Reports are generated, not committed
 reports/*.png
