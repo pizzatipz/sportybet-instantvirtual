@@ -29,6 +29,45 @@ PROFILE_DIR = Path(__file__).parent.parent / "data" / "browser_profile"
 # SportyBet virtual soccer URL
 SPORTYBET_VIRTUALS_URL = "https://www.sportybet.com/ng/sporty-instant-virtuals?from=games"
 
+# ──────────────────────────────────────────────────────────
+#  BETTING STRATEGY CONFIG (derived from backtesting)
+# ──────────────────────────────────────────────────────────
+
+# Top categories by jackpot rate (1.75%+ observed)
+TARGET_CATEGORIES = {"Club World Cup", "African Cup", "Champions"}
+
+# Teams with highest jackpot involvement
+# Home teams that come from behind to win (jackpot = Away/Home)
+TARGET_HOME_TEAMS = {
+    "PSG", "ARS", "ATM", "BAY", "NEW", "ENG", "FLU", "HIL",
+    "RMA", "SVK", "CIV", "BEN", "BMU", "BOU", "COD", "COM",
+    "FRA", "GAB", "GIR", "INT",
+}
+
+# Away teams that lead at HT but lose at FT
+TARGET_AWAY_TEAMS = {
+    "FLA", "CHE", "JUV", "PAC", "AIN", "BMU", "ITA", "KOE",
+    "UKR", "ZMB", "ALA", "BEL", "BOC", "BVB", "EGY", "FCB",
+    "LEC", "LEV", "OVI",
+}
+
+
+def fixture_matches_strategy(fixture: dict) -> bool:
+    """Check if a fixture matches our betting strategy.
+
+    A fixture qualifies if:
+    - It's in a target category, OR
+    - The home team is a known comeback team, OR
+    - The away team is a known choke team
+    """
+    if fixture.get("category") in TARGET_CATEGORIES:
+        return True
+    if fixture.get("home_team") in TARGET_HOME_TEAMS:
+        return True
+    if fixture.get("away_team") in TARGET_AWAY_TEAMS:
+        return True
+    return False
+
 
 async def launch_browser(headless: bool = False, persistent: bool = True) -> tuple:
     """Launch browser with persistent profile for session/cookie reuse.
@@ -903,6 +942,102 @@ async def full_bet_and_kickoff(page, fixture_idx: int = 0, selection: str = "Awa
     return odds
 
 
+async def place_strategic_bets(page, fixtures: list[dict], selection: str = "Away/ Home"):
+    """
+    Place bets on all fixtures that match our strategy.
+
+    Flow for each qualifying fixture:
+    1. Click fixture → match detail
+    2. Scroll to HT/FT, select Away/Home
+    3. Place Bet → Confirm
+    4. Go back to betting list
+    5. Repeat for next fixture
+    Then: Kick Off → Skip to Result
+
+    Args:
+        page: iframe frame on betting screen
+        fixtures: list of fixture dicts from scrape_betting_screen()
+        selection: HT/FT outcome to bet on
+
+    Returns number of bets placed.
+    """
+    # Find qualifying fixtures
+    qualifying = []
+    for idx, f in enumerate(fixtures):
+        if fixture_matches_strategy(f):
+            qualifying.append((idx, f))
+
+    if not qualifying:
+        print("  No fixtures match the strategy this round.")
+        return 0
+
+    print(f"\n  🎯 {len(qualifying)} fixtures match strategy:")
+    for idx, f in qualifying[:5]:
+        print(f"     [{idx}] {f['category']}: {f['home_team']} vs {f['away_team']}")
+    if len(qualifying) > 5:
+        print(f"     ... and {len(qualifying) - 5} more")
+
+    bets_placed = 0
+    for fixture_num, (idx, f) in enumerate(qualifying):
+        cat = f['category']
+        home = f['home_team']
+        away = f['away_team']
+        print(f"\n  📌 Bet {fixture_num + 1}/{len(qualifying)}: {home} vs {away} ({cat})")
+
+        # Open fixture detail
+        if not await open_fixture_detail(page, idx):
+            print(f"    ⚠️  Could not open fixture")
+            continue
+
+        # Scrape HT/FT odds
+        odds = await scrape_htft_odds_from_detail(page)
+        if odds:
+            ah_odds = odds.get("away_home", "?")
+            print(f"    📊 Away/Home odds: {ah_odds}")
+
+        # Select the outcome
+        if not await select_htft_outcome(page, selection):
+            print(f"    ⚠️  Could not select '{selection}'")
+            await go_back_to_betting(page)
+            continue
+
+        await asyncio.sleep(1)
+
+        # Place Bet
+        if not await click_place_bet(page):
+            print(f"    ⚠️  Place Bet failed")
+            await go_back_to_betting(page)
+            continue
+
+        # Confirm
+        if await click_confirm(page):
+            bets_placed += 1
+            print(f"    ✅ Bet confirmed!")
+        else:
+            print(f"    ⚠️  Confirm failed")
+
+        # Go back to betting list for the next fixture
+        await go_back_to_betting(page)
+        await asyncio.sleep(1)
+
+    print(f"\n  💰 {bets_placed}/{len(qualifying)} bets placed this round")
+
+    # Kick Off
+    await asyncio.sleep(1)
+    if await click_kick_off(page):
+        print("  ⚽ Kick Off!")
+    else:
+        print("  ⚠️  Kick Off not found, trying Next Round...")
+        await click_next_round(page)
+
+    # Skip to Result
+    await asyncio.sleep(3)
+    if await click_skip_to_result(page):
+        print("  ⏭️  Skipped to result")
+
+    return bets_placed
+
+
 # ──────────────────────────────────────────────────────────
 #  ERROR RECOVERY + SESSION MONITORING
 # ──────────────────────────────────────────────────────────
@@ -1120,25 +1255,12 @@ async def run_scraper(rounds: int = 0, headless: bool = False, manual: bool = Fa
                         print(f"   ... and {len(fixtures) - 3} more")
 
                     if place_bets:
-                        # Full betting flow:
-                        # Select → Place Bet → Confirm → Kick Off → Skip to Result
-                        print("\n  🎯 Opening first fixture to place HT/FT bet...")
-                        odds_data = await place_bet_on_fixture(
-                            target, fixture_idx=0, selection="Away/ Home"
+                        # Strategic multi-fixture betting:
+                        # Bet Away/Home on all fixtures matching our strategy
+                        # (target categories + jackpot-prone teams)
+                        bets = await place_strategic_bets(
+                            target, fixtures, selection="Away/ Home"
                         )
-
-                        # Kick Off
-                        await asyncio.sleep(1)
-                        if await click_kick_off(target):
-                            print("  ⚽ Kick Off!")
-                        else:
-                            print("  ⚠️  Kick Off not found, trying Next Round...")
-                            await click_next_round(target)
-
-                        # Skip to Result
-                        await asyncio.sleep(3)
-                        if await click_skip_to_result(target):
-                            print("  ⏭️  Skipped to result")
                     else:
                         # Observe only — just click Next Round
                         if await click_next_round(target):
