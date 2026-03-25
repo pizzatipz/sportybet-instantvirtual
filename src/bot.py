@@ -30,26 +30,200 @@ PROFILE_DIR = Path(__file__).parent.parent / "data" / "browser_profile"
 SPORTYBET_VIRTUALS_URL = "https://www.sportybet.com/ng/sporty-instant-virtuals?from=games"
 
 # ──────────────────────────────────────────────────────────
-#  BETTING STRATEGY CONFIG (derived from backtesting)
+#  ADAPTIVE BETTING STRATEGY
+#  Re-learns from all collected data every LEARN_INTERVAL rounds.
+#  Updates target categories and teams based on actual jackpot rates.
 # ──────────────────────────────────────────────────────────
 
-# Top categories by jackpot rate (1.75%+ observed)
-TARGET_CATEGORIES = {"Club World Cup", "African Cup", "Champions"}
+LEARN_INTERVAL = 10  # Re-analyze data every N rounds
+MIN_SAMPLES = 50     # Minimum matches for a team/category before trusting its rate
+CATEGORY_THRESHOLD = 1.2   # Bet on categories with jackpot rate >= this %
+TEAM_MIN_JACKPOTS = 2      # Team needs >= this many jackpots to be targeted
 
-# Teams with highest jackpot involvement
-# Home teams that come from behind to win (jackpot = Away/Home)
+# Initial targets (from first 103 rounds of backtesting)
+# These get overwritten by learn_from_data() after first interval.
+TARGET_CATEGORIES = {"Club World Cup", "African Cup", "Champions"}
 TARGET_HOME_TEAMS = {
     "PSG", "ARS", "ATM", "BAY", "NEW", "ENG", "FLU", "HIL",
-    "RMA", "SVK", "CIV", "BEN", "BMU", "BOU", "COD", "COM",
-    "FRA", "GAB", "GIR", "INT",
+    "RMA", "SVK", "CIV",
 }
-
-# Away teams that lead at HT but lose at FT
 TARGET_AWAY_TEAMS = {
     "FLA", "CHE", "JUV", "PAC", "AIN", "BMU", "ITA", "KOE",
-    "UKR", "ZMB", "ALA", "BEL", "BOC", "BVB", "EGY", "FCB",
-    "LEC", "LEV", "OVI",
+    "UKR", "ZMB",
 }
+
+
+def learn_from_data(conn) -> dict:
+    """Analyze all collected data and update strategy targets.
+
+    Queries the database for:
+    - Jackpot rates by category
+    - Teams most involved in jackpots (home and away)
+    - Overall jackpot rate vs implied
+    - Recent trends (last 20 rounds vs all time)
+
+    Returns a report dict and updates the global target sets.
+    """
+    global TARGET_CATEGORIES, TARGET_HOME_TEAMS, TARGET_AWAY_TEAMS
+
+    total = conn.execute("SELECT COUNT(*) FROM matches").fetchone()[0]
+    if total < 100:
+        return {"status": "insufficient_data", "total_matches": total}
+
+    total_jp = conn.execute(
+        "SELECT COUNT(*) FROM matches WHERE is_jackpot=1"
+    ).fetchone()[0]
+    overall_rate = total_jp / total if total > 0 else 0
+
+    # ── Category analysis ────────────────────────────────
+    cat_rows = conn.execute("""
+        SELECT category, COUNT(*) as n, SUM(is_jackpot) as jp,
+               ROUND(SUM(is_jackpot) * 100.0 / COUNT(*), 3) as rate
+        FROM matches GROUP BY category ORDER BY rate DESC
+    """).fetchall()
+
+    new_categories = set()
+    cat_report = []
+    for r in cat_rows:
+        rate = r['jp'] / r['n'] * 100 if r['n'] > 0 else 0
+        qualifies = rate >= CATEGORY_THRESHOLD and r['n'] >= MIN_SAMPLES
+        cat_report.append({
+            "category": r['category'], "matches": r['n'],
+            "jackpots": r['jp'], "rate": round(rate, 2),
+            "targeted": qualifies,
+        })
+        if qualifies:
+            new_categories.add(r['category'])
+
+    # ── Home team analysis (comeback teams) ──────────────
+    home_rows = conn.execute("""
+        SELECT home_team, COUNT(*) as n, SUM(is_jackpot) as jp
+        FROM matches GROUP BY home_team
+        HAVING jp >= ?
+        ORDER BY jp DESC
+    """, (TEAM_MIN_JACKPOTS,)).fetchall()
+
+    new_home_teams = set()
+    home_report = []
+    for r in home_rows:
+        rate = r['jp'] / r['n'] * 100 if r['n'] > 0 else 0
+        new_home_teams.add(r['home_team'])
+        home_report.append({
+            "team": r['home_team'], "matches": r['n'],
+            "jackpots": r['jp'], "rate": round(rate, 2),
+        })
+
+    # ── Away team analysis (choke teams) ─────────────────
+    away_rows = conn.execute("""
+        SELECT away_team, COUNT(*) as n, SUM(is_jackpot) as jp
+        FROM matches GROUP BY away_team
+        HAVING jp >= ?
+        ORDER BY jp DESC
+    """, (TEAM_MIN_JACKPOTS,)).fetchall()
+
+    new_away_teams = set()
+    away_report = []
+    for r in away_rows:
+        rate = r['jp'] / r['n'] * 100 if r['n'] > 0 else 0
+        new_away_teams.add(r['away_team'])
+        away_report.append({
+            "team": r['away_team'], "matches": r['n'],
+            "jackpots": r['jp'], "rate": round(rate, 2),
+        })
+
+    # ── Recent trend (last 20 rounds) ────────────────────
+    recent_rows = conn.execute("""
+        SELECT m.is_jackpot FROM matches m
+        JOIN rounds r ON m.round_id = r.round_id
+        ORDER BY r.id DESC LIMIT 1780
+    """).fetchall()  # ~20 rounds × 89 matches
+    recent_total = len(recent_rows)
+    recent_jp = sum(r['is_jackpot'] for r in recent_rows)
+    recent_rate = recent_jp / recent_total * 100 if recent_total > 0 else 0
+
+    # ── Detect changes ───────────────────────────────────
+    added_cats = new_categories - TARGET_CATEGORIES
+    removed_cats = TARGET_CATEGORIES - new_categories
+    added_home = new_home_teams - TARGET_HOME_TEAMS
+    removed_home = TARGET_HOME_TEAMS - new_home_teams
+    added_away = new_away_teams - TARGET_AWAY_TEAMS
+    removed_away = TARGET_AWAY_TEAMS - new_away_teams
+
+    # ── Apply updates ────────────────────────────────────
+    TARGET_CATEGORIES = new_categories
+    TARGET_HOME_TEAMS = new_home_teams
+    TARGET_AWAY_TEAMS = new_away_teams
+
+    report = {
+        "status": "updated",
+        "total_matches": total,
+        "total_jackpots": total_jp,
+        "overall_rate": round(overall_rate * 100, 2),
+        "recent_rate": round(recent_rate, 2),
+        "categories": cat_report,
+        "home_teams": home_report[:15],
+        "away_teams": away_report[:15],
+        "target_categories": sorted(new_categories),
+        "target_home_teams": sorted(new_home_teams),
+        "target_away_teams": sorted(new_away_teams),
+        "changes": {
+            "added_categories": sorted(added_cats),
+            "removed_categories": sorted(removed_cats),
+            "added_home_teams": sorted(added_home),
+            "removed_home_teams": sorted(removed_home),
+            "added_away_teams": sorted(added_away),
+            "removed_away_teams": sorted(removed_away),
+        },
+    }
+    return report
+
+
+def print_learning_report(report: dict) -> None:
+    """Print a summary of what the strategy learned."""
+    if report.get("status") == "insufficient_data":
+        print(f"  📚 Not enough data yet ({report['total_matches']} matches)")
+        return
+
+    print(f"\n  {'=' * 50}")
+    print(f"  📚 STRATEGY UPDATE (learned from {report['total_matches']} matches)")
+    print(f"  {'=' * 50}")
+    print(f"  Overall jackpot rate: {report['overall_rate']}%")
+    print(f"  Recent rate (last ~20 rounds): {report['recent_rate']}%")
+
+    trend = ""
+    if report['recent_rate'] > report['overall_rate'] + 0.2:
+        trend = " 📈 trending UP"
+    elif report['recent_rate'] < report['overall_rate'] - 0.2:
+        trend = " 📉 trending DOWN"
+    else:
+        trend = " ➡️ stable"
+    print(f"  Trend: {trend}")
+
+    print(f"\n  Target categories ({len(report['target_categories'])}):")
+    for cr in report['categories']:
+        marker = " ✓" if cr['targeted'] else ""
+        print(f"    {cr['category']:<18} {cr['rate']:>5.2f}% ({cr['jackpots']}/{cr['matches']}){marker}")
+
+    changes = report['changes']
+    has_changes = any(v for v in changes.values())
+    if has_changes:
+        print(f"\n  🔄 Changes since last update:")
+        if changes['added_categories']:
+            print(f"    + Categories: {', '.join(changes['added_categories'])}")
+        if changes['removed_categories']:
+            print(f"    - Categories: {', '.join(changes['removed_categories'])}")
+        if changes['added_home_teams']:
+            print(f"    + Home teams: {', '.join(changes['added_home_teams'][:8])}")
+        if changes['removed_home_teams']:
+            print(f"    - Home teams: {', '.join(changes['removed_home_teams'][:8])}")
+        if changes['added_away_teams']:
+            print(f"    + Away teams: {', '.join(changes['added_away_teams'][:8])}")
+        if changes['removed_away_teams']:
+            print(f"    - Away teams: {', '.join(changes['removed_away_teams'][:8])}")
+    else:
+        print(f"\n  No strategy changes — current targets remain optimal.")
+
+    print(f"  {'=' * 50}")
 
 
 def fixture_matches_strategy(fixture: dict) -> bool:
@@ -1217,8 +1391,19 @@ async def run_scraper(rounds: int = 0, headless: bool = False, manual: bool = Fa
         target = await wait_for_login(page)
         consecutive_errors = 0
 
+        # Initial strategy learning from existing data
+        print("\n  📚 Loading strategy from historical data...")
+        report = learn_from_data(conn)
+        print_learning_report(report)
+
         rounds_scraped = 0
         while rounds == 0 or rounds_scraped < rounds:
+            # ── Periodic re-learning ─────────────────────────────
+            if rounds_scraped > 0 and rounds_scraped % LEARN_INTERVAL == 0:
+                print("\n  📚 Re-learning strategy from updated data...")
+                report = learn_from_data(conn)
+                print_learning_report(report)
+
             print(f"\n{'─' * 50}")
             print(f"Round cycle #{rounds_scraped + 1}")
 
