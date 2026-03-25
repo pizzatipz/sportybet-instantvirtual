@@ -398,6 +398,20 @@ async def scrape_round_results(page: Page) -> tuple[str | None, list[dict]]:
     matches = []
 
     try:
+        # ── 0. Dismiss any popups/overlays blocking the page ─────
+        await dismiss_win_splash(page)
+        # Disable pointer-events on wrapper overlays so clicks pass through.
+        # #instant-win-wrapper wraps the whole results area — don't hide it,
+        # just make it transparent to clicks.
+        await page.evaluate(r"""() => {
+            const iw = document.querySelector('#instant-win-wrapper');
+            if (iw) { iw.style.pointerEvents = 'none'; }
+            // Remove pointer events from winngin-pop if still around
+            const wp = document.querySelector('#winngin-pop');
+            if (wp) { wp.style.display = 'none'; }
+        }""")
+        # Use force=True for all tab clicks below to bypass any remaining overlays
+
         # ── 1. Extract round ID from the iframe URL ──────────────
         round_id = None
         try:
@@ -424,8 +438,8 @@ async def scrape_round_results(page: Page) -> tuple[str | None, list[dict]]:
             return round_id, []
 
         for tab, category in tab_names:
-            # Click the tab to switch categories
-            await tab.click()
+            # Click the tab to switch categories (force=True bypasses overlays)
+            await tab.click(force=True)
             await asyncio.sleep(0.6)  # let results render
 
             # ── 3. Scrape match rows for this category ───────────
@@ -690,72 +704,22 @@ async def click_next_round(page) -> bool:
 async def dismiss_win_splash(page) -> bool:
     """Dismiss the winning splash screen popup if present.
     
-    After results, if any bet won, a popup appears with id='winngin-pop'
-    (SportyBet's typo). It blocks all interaction until dismissed.
+    After results, if any bet won, a popup appears with id='winngin-pop'.
+    We HIDE it (don't click Next Round inside it) so we can still see 
+    and scrape the results behind it.
     """
     try:
-        dismissed = await page.evaluate(r"""() => {
-            // Primary: the exact SportyBet winning popup (note: "winngin" typo)
-            const winPop = document.querySelector('#winngin-pop');
-            if (winPop && winPop.offsetHeight > 0) {
-                // Find Next Round or any clickable button inside it
-                const btns = winPop.querySelectorAll('span, button, div, a');
-                for (const btn of btns) {
-                    const txt = (btn.textContent || '').trim();
-                    if ((txt === 'Next Round' || txt === 'NEXT ROUND' || txt === 'OK' ||
-                         txt === 'Continue' || txt === 'Close' || txt === 'Got it')
-                        && btn.offsetHeight > 0 && btn.children.length < 3) {
-                        btn.click();
-                        return 'winngin-pop: ' + txt;
-                    }
-                }
-                // Click the popup content itself as fallback
-                const content = winPop.querySelector('.content');
-                if (content) { content.click(); return 'winngin-pop: content'; }
-                winPop.click();
-                return 'winngin-pop: self';
+        hidden = await page.evaluate(r"""() => {
+            const pop = document.querySelector('#winngin-pop');
+            if (pop && pop.offsetHeight > 0) {
+                pop.style.display = 'none';
+                return true;
             }
-            
-            // Fallback: search for any overlay blocking the page
-            const overlays = document.querySelectorAll(
-                '.m-dialog, .m-dialog-main, [class*="popup"], [class*="splash"], ' +
-                '[class*="congratulation"], [class*="winning"], [class*="winngin"], ' +
-                '[class*="won"], [class*="modal"], [class*="overlay"], [class*="result-pop"]'
-            );
-            
-            for (const overlay of overlays) {
-                if (overlay.offsetHeight === 0) continue;
-                const btns = overlay.querySelectorAll('span, button, div, a');
-                for (const btn of btns) {
-                    const txt = (btn.textContent || '').trim();
-                    if ((txt === 'Next Round' || txt === 'NEXT ROUND' || 
-                         txt === 'Continue' || txt === 'OK' || txt === 'Close' || txt === 'Got it')
-                        && btn.offsetHeight > 0 && btn.children.length < 3) {
-                        btn.click();
-                        return 'overlay: ' + txt;
-                    }
-                }
-            }
-            
-            // Last resort: any visible "Next Round" NOT in bottom nav
-            const allEls = document.querySelectorAll('span, div');
-            for (const el of allEls) {
-                const txt = (el.textContent || '').trim();
-                if (txt === 'Next Round' && el.offsetHeight > 0 && el.children.length < 2) {
-                    const parent = el.closest('.nav-bottom-left, .nav-bottom-right, .btn-nav-bottom');
-                    if (!parent) {
-                        el.click();
-                        return 'popup-next-round';
-                    }
-                }
-            }
-            
-            return null;
+            return false;
         }""")
-        
-        if dismissed:
-            print(f"  🎉 Win splash dismissed ({dismissed})")
-            await asyncio.sleep(2)
+        if hidden:
+            print("  🎉 Win splash hidden (results visible now)")
+            await asyncio.sleep(1)
             return True
         return False
     except Exception:
@@ -1653,12 +1617,49 @@ async def run_scraper(rounds: int = 0, headless: bool = False, manual: bool = Fa
                             target, fixtures, selection="Away/ Home"
                         )
                     else:
-                        # Observe only — just click Next Round
-                        if await click_next_round(target):
-                            print("⏭️  'Next Round' clicked — match starting...")
-                        else:
-                            print("Press Enter when the match starts...")
-                            await asyncio.get_event_loop().run_in_executor(None, input)
+                        # Observe mode — place 1 bet to trigger the full flow
+                        # (SportyBet requires a bet to show results)
+                        print("\n  📡 Observe mode — placing 1 min bet...")
+                        
+                        # Open first fixture
+                        if await open_fixture_detail(target, 0):
+                            # Select Away/Home
+                            await select_htft_outcome(target, "Away/ Home")
+                            await asyncio.sleep(1)
+                            # Place Bet
+                            if await click_place_bet(target):
+                                print("  📝 Place Bet clicked")
+                                # Confirm
+                                if await click_confirm(target):
+                                    print("  ✅ Bet confirmed!")
+                            
+                            # Go back to betting list
+                            await go_back_to_betting(target)
+                            await asyncio.sleep(1)
+                        
+                        # Now click Open Bets → Kick Off → Skip
+                        # Open Bets (bottom left)
+                        for selector in [
+                            "[data-op='iv-main-open-bets']",
+                            ".nav-bottom-left .action-button-sub-container",
+                            ".nav-bottom-left span",
+                            ".nav-bottom-left",
+                        ]:
+                            btn = await target.query_selector(selector)
+                            if btn:
+                                await btn.click(force=True)
+                                print("  📋 Open Bets clicked")
+                                await asyncio.sleep(2)
+                                break
+
+                        # Kick Off (bottom right)
+                        if await click_kick_off(target):
+                            print("  ⚽ Kick Off!")
+                        
+                        # Skip to Result
+                        await asyncio.sleep(3)
+                        if await click_skip_to_result(target):
+                            print("  ⏭️  Skipped to result")
                 else:
                     print("⚠️  Could not scrape betting screen fixtures.")
                     if await click_next_round(target):
