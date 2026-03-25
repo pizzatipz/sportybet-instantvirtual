@@ -1,0 +1,40 @@
+# Dependencies
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Data (local only — contains personal betting data)
+data/*.db
+data/*.sqlite
+data/*.csv
+
+# Reports are generated, not committed
+reports/*.png
+reports/*.html
+reports/*.txt
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Browser profile (contains login session)
+browser_data/
+
+# Environment variables
+.env
