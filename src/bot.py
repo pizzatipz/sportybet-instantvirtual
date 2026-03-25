@@ -37,7 +37,7 @@ SPORTYBET_VIRTUALS_URL = "https://www.sportybet.com/ng/sporty-instant-virtuals?f
 
 LEARN_INTERVAL = 10  # Re-analyze data every N rounds
 MIN_SAMPLES = 50     # Minimum matches for a team/category before trusting its rate
-CATEGORY_THRESHOLD = 1.2   # Bet on categories with jackpot rate >= this %
+CATEGORY_THRESHOLD = 1.5    # Bet on categories with jackpot rate >= this %
 TEAM_MIN_JACKPOTS = 2      # Team needs >= this many jackpots to be targeted
 
 # Initial targets (from first 103 rounds of backtesting)
@@ -1158,9 +1158,36 @@ async def place_strategic_bets(page, fixtures: list[dict], selection: str = "Awa
         away = f['away_team']
         print(f"\n  📌 Bet {fixture_num + 1}/{len(qualifying)}: {home} vs {away} ({cat})")
 
-        # Open fixture detail
-        if not await open_fixture_detail(page, idx):
-            print(f"    ⚠️  Could not open fixture")
+        # Re-query fixture rows (DOM refreshes after each back navigation)
+        fixture_rows = await page.query_selector_all(
+            ".event-list.spacer-team .event-list__main .teams-cell"
+        )
+
+        # Find the fixture by matching team names (not index — DOM shifts)
+        target_row = None
+        for row in fixture_rows:
+            row_text = (await row.text_content() or "")
+            if home in row_text and away in row_text:
+                target_row = row
+                break
+
+        if not target_row:
+            print(f"    ⚠️  Could not find fixture in DOM")
+            continue
+
+        # Click the fixture to open detail page
+        try:
+            await target_row.click()
+            await asyncio.sleep(1.5)
+        except Exception:
+            print(f"    ⚠️  Could not click fixture")
+            continue
+
+        # Verify we're on the detail page
+        detail = await page.query_selector("span[data-op='event_detail__market']")
+        if not detail:
+            print(f"    ⚠️  Detail page didn't load")
+            await go_back_to_betting(page)
             continue
 
         # Scrape HT/FT odds
