@@ -903,6 +903,103 @@ async def select_htft_outcome(page, selection: str) -> bool:
         return False
 
 
+async def select_over_under(page, line: float = 2.5, over: bool = True) -> bool:
+    """
+    On a match detail page, scroll to O/U section and click Over or Under
+    for the specified line (e.g., Over 2.5).
+    """
+    try:
+        clicked = await page.evaluate(r"""(args) => {
+            const [targetLine, selectOver] = args;
+            const headers = document.querySelectorAll('span[data-op="event_detail__market"]');
+            let market = null;
+            for (const h of headers) {
+                const txt = (h.textContent || '').trim();
+                if (txt === 'O/U' || txt === 'Over/Under') {
+                    market = h.closest('.market');
+                    break;
+                }
+            }
+            if (!market) return false;
+
+            const rows = market.querySelectorAll('.specifier-row');
+            for (const row of rows) {
+                const lineEl = row.querySelector('.specifier-column-title em');
+                if (!lineEl) continue;
+                if ((lineEl.textContent || '').trim() === String(targetLine)) {
+                    const outcomes = row.querySelectorAll('.iw-outcome:not(.specifier-column-title)');
+                    const idx = selectOver ? 0 : 1;
+                    if (outcomes.length > idx) {
+                        outcomes[idx].scrollIntoView({ behavior: 'instant', block: 'center' });
+                        outcomes[idx].click();
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }""", [line, over])
+        if clicked:
+            await asyncio.sleep(0.5)
+        return clicked
+    except Exception:
+        return False
+
+
+async def place_steady_bet(page, category: str, home: str, away: str) -> list[str]:
+    """
+    Place Steady strategy bets on a single fixture.
+    Italy/England -> Draw/Draw | Germany/Champions -> Over 2.5
+    """
+    bets_placed = []
+
+    clicked = await page.evaluate(r"""(args) => {
+        const [home, away] = args;
+        const cells = document.querySelectorAll('.event-list .teams-cell, .teams-info-wrap');
+        for (const cell of cells) {
+            const txt = cell.textContent || '';
+            if (txt.includes(home) && txt.includes(away)) {
+                cell.scrollIntoView({ behavior: 'instant', block: 'center' });
+                cell.click();
+                return true;
+            }
+        }
+        return false;
+    }""", [home, away])
+
+    if not clicked:
+        return bets_placed
+    await asyncio.sleep(1.5)
+
+    detail = await page.query_selector("span[data-op='event_detail__market']")
+    if not detail:
+        await go_back_to_betting(page)
+        return bets_placed
+
+    if category in ('Italy', 'England'):
+        if await select_htft_outcome(page, "Draw/ Draw"):
+            await asyncio.sleep(1)
+            if await click_place_bet(page):
+                if await click_confirm(page):
+                    bets_placed.append("DD")
+    elif category in ('Germany', 'Champions'):
+        if await select_over_under(page, line=2.5, over=True):
+            await asyncio.sleep(1)
+            if await click_place_bet(page):
+                if await click_confirm(page):
+                    bets_placed.append("O2.5")
+
+    await go_back_to_betting(page)
+    await asyncio.sleep(1)
+    for _ in range(5):
+        has_tabs = await page.query_selector("li.sport-type-item[data-op='iv-league-tabs']")
+        if has_tabs:
+            break
+        await go_back_to_betting(page)
+        await asyncio.sleep(1)
+
+    return bets_placed
+
+
 async def click_betslip(page) -> bool:
     """Click the 'Betslip' button at the bottom."""
     btn = await page.query_selector(
@@ -1553,15 +1650,15 @@ async def manual_entry_mode(conn, round_id: str) -> list[dict]:
 
 
 async def run_scraper(rounds: int = 0, headless: bool = False, manual: bool = False,
-                      place_bets: bool = False) -> None:
+                      place_bets: bool = False, steady_mode: bool = False) -> None:
     """
     Main scraping loop — handles the full round lifecycle:
 
     1. Detect current screen (betting / live / results)
     2. On BETTING screen:
-       - If place_bets: click fixture → scroll to HT/FT → select Away/Home →
-         Place Bet → Kick Off
-       - Otherwise: just scrape fixtures and click Next Round
+       - If place_bets: HT/FT Away/Home strategy (jackpots)
+       - If steady_mode: Draw/Draw + Over 2.5 strategy (steady profit)
+       - Otherwise: observe mode (1 min bet for results access)
     3. On RESULTS screen: scrape all match results across categories
     4. Click "Next Round" and repeat
 
@@ -1632,10 +1729,81 @@ async def run_scraper(rounds: int = 0, headless: bool = False, manual: bool = Fa
                     if place_bets:
                         # Strategic multi-fixture betting:
                         # Bet Away/Home on all fixtures matching our strategy
-                        # (target categories + jackpot-prone teams)
                         bets = await place_strategic_bets(
                             target, fixtures, selection="Away/ Home"
                         )
+                    elif steady_mode:
+                        # Steady strategy: Draw/Draw + Over 2.5
+                        from collections import defaultdict as _dd2
+                        steady_cats = {'Italy': [], 'England': [], 'Germany': [], 'Champions': []}
+                        for f in fixtures:
+                            if f['category'] in steady_cats:
+                                steady_cats[f['category']].append(f)
+
+                        total_steady = sum(len(v) for v in steady_cats.values())
+                        print(f"\n  📈 Steady strategy: {total_steady} fixtures")
+                        for cat, fxs in steady_cats.items():
+                            if fxs:
+                                mkt = "DD" if cat in ('Italy', 'England') else "O2.5"
+                                print(f"     {cat} ({mkt}): {len(fxs)} fixtures")
+
+                        steady_bets = 0
+                        for cat in ['Italy', 'England', 'Germany', 'Champions']:
+                            if not steady_cats[cat]:
+                                continue
+
+                            # Click category tab
+                            await page.evaluate(r"""(catName) => {
+                                const tabs = document.querySelectorAll('li.sport-type-item');
+                                for (const tab of tabs) {
+                                    if ((tab.textContent || '').trim() === catName) {
+                                        tab.click(); return true;
+                                    }
+                                }
+                                return false;
+                            }""", cat)
+                            await asyncio.sleep(0.8)
+
+                            for f in steady_cats[cat]:
+                                home = f['home_team']
+                                away = f['away_team']
+                                mkt = "DD" if cat in ('Italy', 'England') else "O2.5"
+                                print(f"\n  📌 {home} vs {away} ({cat}) [{mkt}]")
+
+                                placed = await place_steady_bet(target, cat, home, away)
+                                if placed:
+                                    steady_bets += len(placed)
+                                    print(f"    ✅ {', '.join(placed)} confirmed!")
+                                else:
+                                    print(f"    ⚠️  Could not place bet")
+
+                                if steady_bets >= 30:
+                                    break
+                            if steady_bets >= 30:
+                                break
+
+                        print(f"\n  💰 {steady_bets} steady bets placed")
+
+                        # Open Bets → Kick Off → Skip
+                        await asyncio.sleep(1)
+                        for selector in [
+                            "[data-op='iv-main-open-bets']",
+                            ".nav-bottom-left .action-button-sub-container",
+                            ".nav-bottom-left span",
+                            ".nav-bottom-left",
+                        ]:
+                            btn = await target.query_selector(selector)
+                            if btn:
+                                await btn.click(force=True)
+                                print("  📋 Open Bets clicked")
+                                await asyncio.sleep(2)
+                                break
+
+                        if await click_kick_off(target):
+                            print("  ⚽ Kick Off!")
+                        await asyncio.sleep(3)
+                        if await click_skip_to_result(target):
+                            print("  ⏭️  Skipped to result")
                     else:
                         # Observe mode — place 1 bet to trigger the full flow
                         # (SportyBet requires a bet to show results)
@@ -2185,7 +2353,11 @@ def main():
     )
     parser.add_argument(
         "--bet", action="store_true",
-        help="Place bets on Away/Home each round (requires login + balance)"
+        help="Place HT/FT Away/Home bets (jackpot strategy)"
+    )
+    parser.add_argument(
+        "--steady", action="store_true",
+        help="Place Steady strategy bets (Draw/Draw + Over 2.5)"
     )
     parser.add_argument(
         "--inspect", action="store_true",
@@ -2201,6 +2373,7 @@ def main():
             headless=args.headless,
             manual=args.manual,
             place_bets=args.bet,
+            steady_mode=args.steady,
         ))
 
 
