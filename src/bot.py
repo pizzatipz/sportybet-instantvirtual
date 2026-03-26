@@ -1221,24 +1221,27 @@ async def scrape_all_market_odds(page) -> dict:
     """Scrape ALL available market odds from a match detail page.
 
     Returns a dict with:
-    - 'ou': {0.5: (over, under), 1.5: ..., 2.5: ..., 3.5: ..., 4.5: ..., 5.5: ...}
-    - 'htft': {home_home: odds, draw_draw: odds, ...}
-    - '1x2': {home: odds, draw: odds, away: odds}  (if visible on detail)
+    - 'ou': {'0.5': [over, under], '1.5': ..., '2.5': ..., etc.}
+    - 'htft': {'Home/ Home': odds, 'Draw/ Draw': odds, ...}
+    - 'onextwox': {home: odds, draw: odds, away: odds}
+    - 'dc': {'1X': odds, '12': odds, 'X2': odds}
+    - 'gg_ng': {'GG': odds, 'NG': odds}
+    - 'all_markets': {market_name: [{label: odds}, ...]}  (everything else)
     """
     result = {}
 
     try:
         data = await page.evaluate(r"""() => {
-            const out = { ou: {}, htft: {}, onextwox: {} };
+            const out = { ou: {}, htft: {}, onextwox: {}, dc: {}, gg_ng: {}, all_markets: {} };
 
-            // ── O/U Market ──────────────────────────
             const headers = document.querySelectorAll('span[data-op="event_detail__market"]');
             for (const h of headers) {
                 const txt = (h.textContent || '').trim();
+                const market = h.closest('.market');
+                if (!market) continue;
 
+                // ── O/U Market ──────────────────────────
                 if (txt === 'O/U' || txt === 'Over/Under') {
-                    const market = h.closest('.market');
-                    if (!market) continue;
                     const rows = market.querySelectorAll('.specifier-row');
                     for (const row of rows) {
                         const lineEl = row.querySelector('.specifier-column-title em');
@@ -1255,12 +1258,11 @@ async def scrape_all_market_odds(page) -> dict:
                             out.ou[line] = [overVal, underVal];
                         }
                     }
+                    continue;
                 }
 
                 // ── HT/FT Market ──────────────────────
                 if (txt.match(/^HT\s*\/\s*FT/i)) {
-                    const market = h.closest('.market');
-                    if (!market) continue;
                     const outcomes = market.querySelectorAll('.iw-outcome');
                     for (const oc of outcomes) {
                         const ems = oc.querySelectorAll('em');
@@ -1270,12 +1272,11 @@ async def scrape_all_market_odds(page) -> dict:
                             if (!isNaN(val)) out.htft[label] = val;
                         }
                     }
+                    continue;
                 }
 
                 // ── 1X2 Market ──────────────────────
                 if (txt === '1X2' || txt === '1x2') {
-                    const market = h.closest('.market');
-                    if (!market) continue;
                     const outcomes = market.querySelectorAll('.iw-outcome');
                     const vals = [];
                     for (const oc of outcomes) {
@@ -1288,7 +1289,56 @@ async def scrape_all_market_odds(page) -> dict:
                     if (vals.length >= 3) {
                         out.onextwox = { home: vals[0], draw: vals[1], away: vals[2] };
                     }
+                    continue;
                 }
+
+                // ── Double Chance ──────────────────────
+                if (txt.match(/double\s*chance/i) || txt === 'DC') {
+                    const outcomes = market.querySelectorAll('.iw-outcome');
+                    for (const oc of outcomes) {
+                        const ems = oc.querySelectorAll('em');
+                        if (ems.length >= 2) {
+                            const label = (ems[0].textContent || '').trim();
+                            const val = parseFloat((ems[1].textContent || '').trim());
+                            if (!isNaN(val)) {
+                                if (label.match(/1.*X|home.*draw/i)) out.dc['1X'] = val;
+                                else if (label.match(/1.*2|home.*away/i)) out.dc['12'] = val;
+                                else if (label.match(/X.*2|draw.*away/i)) out.dc['X2'] = val;
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                // ── GG/NG (Both Teams to Score) ──────────
+                if (txt.match(/GG\s*\/?\s*NG/i) || txt.match(/both.*score/i) || txt === 'GG/NG') {
+                    const outcomes = market.querySelectorAll('.iw-outcome');
+                    for (const oc of outcomes) {
+                        const ems = oc.querySelectorAll('em');
+                        if (ems.length >= 2) {
+                            const label = (ems[0].textContent || '').trim();
+                            const val = parseFloat((ems[1].textContent || '').trim());
+                            if (!isNaN(val)) {
+                                if (label.match(/^GG$|yes/i)) out.gg_ng['GG'] = val;
+                                else if (label.match(/^NG$|no/i)) out.gg_ng['NG'] = val;
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                // ── Any other market: capture generically ──
+                const outcomes = market.querySelectorAll('.iw-outcome');
+                const mktData = [];
+                for (const oc of outcomes) {
+                    const ems = oc.querySelectorAll('em');
+                    if (ems.length >= 2) {
+                        const label = (ems[0].textContent || '').trim();
+                        const val = parseFloat((ems[ems.length-1].textContent || '').trim());
+                        if (!isNaN(val)) mktData.push({label, odds: val});
+                    }
+                }
+                if (mktData.length > 0) out.all_markets[txt] = mktData;
             }
             return out;
         }""")
@@ -1393,6 +1443,60 @@ async def click_betslip(page) -> bool:
         await asyncio.sleep(1.5)
         return True
     return False
+
+
+async def clear_betslip(page) -> int:
+    """Clear all pending bets from the betslip.
+
+    After a crash/restart, the betslip may still contain bets from
+    the previous session. This function removes them all so we start
+    fresh each round.
+
+    Returns the number of bets cleared.
+    """
+    try:
+        cleared = await page.evaluate(r"""() => {
+            // Look for the betslip area and remove/deselect all bets
+            let count = 0;
+
+            // Method 1: Click all "remove bet" (X) buttons in betslip
+            const removeBtns = document.querySelectorAll(
+                '.bet-item .close-icon, .bet-item .remove, ' +
+                '#quick-bet-container .close, .betslip-item .delete'
+            );
+            for (const btn of removeBtns) {
+                btn.click();
+                count++;
+            }
+
+            // Method 2: Deselect all currently selected outcomes
+            const selected = document.querySelectorAll(
+                '.iw-outcome.active, .iw-outcome.selected, ' +
+                '.iw-outcome[class*="active"], .m-outcome-odds-des.active'
+            );
+            for (const sel of selected) {
+                sel.click();
+                count++;
+            }
+
+            // Method 3: Click "Clear All" or "Remove All" if present
+            const clearBtns = document.querySelectorAll(
+                '[data-cms-key="clear_all"], [data-cms-key="remove_all"], ' +
+                '.clear-all, .remove-all'
+            );
+            for (const btn of clearBtns) {
+                btn.click();
+                count++;
+            }
+
+            return count;
+        }""")
+        if cleared and cleared > 0:
+            print(f"  Cleared {cleared} stale bet(s) from betslip")
+            await asyncio.sleep(1)
+        return cleared or 0
+    except Exception:
+        return 0
 
 
 async def click_place_bet(page) -> bool:
@@ -2122,6 +2226,10 @@ async def run_scraper(rounds: int = 0, headless: bool = False, manual: bool = Fa
 
             # ── BETTING screen: place bet + start round ─────────
             if screen == "betting":
+              try:
+                # Clear any stale bets from previous session/crash
+                await clear_betslip(target)
+
                 round_id, fixtures = await scrape_betting_screen(target)
                 # Generate a temporary round_id if URL didn't provide one
                 if not round_id:
@@ -2142,16 +2250,37 @@ async def run_scraper(rounds: int = 0, headless: bool = False, manual: bool = Fa
                         )
                     elif steady_mode:
                         # Steady v2: pairing-based value betting
-                        # Scrape odds for each fixture, evaluate EV per pairing
+                        # Scan ALL fixtures for odds data (valuable for research)
+                        # Only bet on fixtures with sufficient history
                         from collections import defaultdict as _dd2
+
                         by_cat = _dd2(list)
                         for f in fixtures:
                             by_cat[f['category']].append(f)
 
-                        print(f"\n  Steady v2: scanning {len(fixtures)} fixtures for +EV bets")
+                        print(f"\n  Steady v2: scanning all {len(fixtures)} fixtures for odds")
+
+                        # Store 1X2 odds from the betting list (free data)
+                        from src.db import insert_fixture_odds
+                        for f in fixtures:
+                            if f.get('odds_1') and f.get('odds_x') and f.get('odds_2'):
+                                try:
+                                    insert_fixture_odds(conn, {
+                                        'round_id': round_id,
+                                        'category': f['category'],
+                                        'home_team': f['home_team'],
+                                        'away_team': f['away_team'],
+                                        'odds_1': f['odds_1'],
+                                        'odds_x': f['odds_x'],
+                                        'odds_2': f['odds_2'],
+                                        'source': 'list',
+                                    })
+                                except Exception:
+                                    pass
 
                         all_opportunities = []  # (ev, fixture_dict, bet_info)
                         steady_state.start_round()
+                        cats_scanned = 0
 
                         for cat in sorted(by_cat.keys()):
                             cat_fixtures = by_cat[cat]
@@ -2245,15 +2374,31 @@ async def run_scraper(rounds: int = 0, headless: bool = False, manual: bool = Fa
                                     await go_back_to_betting(target)
                                     await asyncio.sleep(0.5)
 
+                            # Free iframe memory after each category
+                            cats_scanned += 1
+                            if cats_scanned % 4 == 0:
+                                try:
+                                    await target.evaluate("window.gc && window.gc()")
+                                except Exception:
+                                    pass
+
                         # Sort by EV and take top 30
                         all_opportunities.sort(key=lambda x: x[0], reverse=True)
                         to_bet = all_opportunities[:MAX_BETS_PER_ROUND]
                         print(f"\n  Found {len(all_opportunities)} +EV opportunities, "
                               f"betting on top {len(to_bet)}")
 
-                        # Now place bets
+                        # Now place bets (cap at 28 to leave headroom for stale bets)
                         steady_bets = 0
+                        bet_failures = 0
                         for ev_val, fix, bet_info in to_bet:
+                            if steady_bets >= 28:
+                                break
+                            # If 3 consecutive failures, betslip may be full
+                            if bet_failures >= 3:
+                                print("  3 consecutive bet failures — betslip may be full, stopping")
+                                break
+
                             cat = fix['category']
                             home = fix['home_team']
                             away = fix['away_team']
@@ -2295,10 +2440,13 @@ async def run_scraper(rounds: int = 0, headless: bool = False, manual: bool = Fa
 
                             if bet_result:
                                 steady_bets += 1
+                                bet_failures = 0
                                 print(f"    {sel} {home}v{away} @{odds_val:.2f} "
                                       f"EV={ev_val*100:+.0f}% CONFIRMED")
+                            else:
+                                bet_failures += 1
 
-                            if steady_bets >= MAX_BETS_PER_ROUND:
+                            if steady_bets >= 28:
                                 break
 
                         print(f"\n  {steady_bets} bets placed this round")
@@ -2342,7 +2490,29 @@ async def run_scraper(rounds: int = 0, headless: bool = False, manual: bool = Fa
                     else:
                         # Observe mode — place 1 bet to trigger the full flow
                         # (SportyBet requires a bet to show results)
-                        print("\n  📡 Observe mode — placing 1 min bet...")
+                        print("\n  Observe mode — placing 1 min bet...")
+
+                        # Store 1X2 odds from the betting list (free data, no page opens)
+                        from src.db import insert_fixture_odds
+                        odds_stored = 0
+                        for f in fixtures:
+                            if f.get('odds_1') and f.get('odds_x') and f.get('odds_2'):
+                                try:
+                                    insert_fixture_odds(conn, {
+                                        'round_id': round_id,
+                                        'category': f['category'],
+                                        'home_team': f['home_team'],
+                                        'away_team': f['away_team'],
+                                        'odds_1': f['odds_1'],
+                                        'odds_x': f['odds_x'],
+                                        'odds_2': f['odds_2'],
+                                        'source': 'list',
+                                    })
+                                    odds_stored += 1
+                                except Exception:
+                                    pass
+                        if odds_stored:
+                            print(f"  Stored 1X2 odds for {odds_stored} fixtures")
                         
                         # Open first fixture
                         if await open_fixture_detail(target, 0):
@@ -2404,6 +2574,20 @@ async def run_scraper(rounds: int = 0, headless: bool = False, manual: bool = Fa
                         target = await recover_iframe(page)
 
                 screen = await detect_screen(target)
+
+              except Exception as e:
+                err_msg = str(e)
+                if any(kw in err_msg for kw in ["detached", "closed", "disposed", "Timeout", "timeout", "Target page"]):
+                    print(f"  Error during betting: {err_msg[:80]}")
+                    print("  Recovering iframe...")
+                    target = await recover_iframe(page)
+                    consecutive_errors += 1
+                    if consecutive_errors >= 5:
+                        print("Too many consecutive errors. Stopping.")
+                        break
+                    continue  # restart the round cycle
+                else:
+                    raise  # re-raise unexpected errors
 
             # ── LIVE screen: wait for results ────────────────────
             elif screen == "live":

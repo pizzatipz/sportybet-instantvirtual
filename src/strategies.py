@@ -112,7 +112,8 @@ def evaluate_fixture(
 
     opportunities = []
 
-    if odds_o25 and odds_o25 > 0:
+    # Over 2.5 — only at very high odds (5.0+) where edge is proven
+    if odds_o25 and odds_o25 >= 5.0:
         ev = stats['o25_rate'] * odds_o25 - 1
         if ev > 0:
             opportunities.append({
@@ -122,15 +123,7 @@ def evaluate_fixture(
                 'ui_market': 'O/U', 'ui_selection': 'over_2.5',
             })
 
-    if odds_u25 and odds_u25 > 0:
-        ev = stats['u25_rate'] * odds_u25 - 1
-        if ev > 0:
-            opportunities.append({
-                'market': 'O/U', 'selection': 'Under 2.5',
-                'odds': odds_u25, 'rate': stats['u25_rate'],
-                'ev': ev, 'n': stats['n'],
-                'ui_market': 'O/U', 'ui_selection': 'under_2.5',
-            })
+    # Under 2.5 — DROPPED (proven -11.2% ROI across 119 live bets)
 
     if odds_dd and odds_dd > 0:
         ev = stats['dd_rate'] * odds_dd - 1

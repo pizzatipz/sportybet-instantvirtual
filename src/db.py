@@ -103,6 +103,48 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_matches_htft ON matches(htft_result);
         CREATE INDEX IF NOT EXISTS idx_matches_jackpot ON matches(is_jackpot);
         CREATE INDEX IF NOT EXISTS idx_matches_teams ON matches(home_team, away_team);
+
+        CREATE TABLE IF NOT EXISTS fixture_odds (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            round_id    TEXT,
+            scraped_at  TEXT NOT NULL,
+            category    TEXT NOT NULL,
+            home_team   TEXT NOT NULL,
+            away_team   TEXT NOT NULL,
+            odds_1      REAL,
+            odds_x      REAL,
+            odds_2      REAL,
+            ou_05_over  REAL,
+            ou_05_under REAL,
+            ou_15_over  REAL,
+            ou_15_under REAL,
+            ou_25_over  REAL,
+            ou_25_under REAL,
+            ou_35_over  REAL,
+            ou_35_under REAL,
+            ou_45_over  REAL,
+            ou_45_under REAL,
+            ou_55_over  REAL,
+            ou_55_under REAL,
+            htft_hh     REAL,
+            htft_hd     REAL,
+            htft_ha     REAL,
+            htft_dh     REAL,
+            htft_dd     REAL,
+            htft_da     REAL,
+            htft_ah     REAL,
+            htft_ad     REAL,
+            htft_aa     REAL,
+            dc_1x       REAL,
+            dc_12       REAL,
+            dc_x2       REAL,
+            gg          REAL,
+            ng          REAL,
+            source      TEXT DEFAULT 'detail'
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_fixture_odds_round ON fixture_odds(round_id);
+        CREATE INDEX IF NOT EXISTS idx_fixture_odds_teams ON fixture_odds(category, home_team, away_team);
     """)
     conn.commit()
 
@@ -371,3 +413,39 @@ def insert_htft_odds_bulk(conn: sqlite3.Connection, odds_list: list[dict]) -> in
         count += 1
     conn.commit()
     return count
+
+
+def insert_fixture_odds(conn: sqlite3.Connection, odds: dict) -> int:
+    """Insert a complete set of fixture odds. Returns the row id."""
+    from datetime import datetime, timezone
+    cursor = conn.execute(
+        """INSERT INTO fixture_odds
+           (round_id, scraped_at, category, home_team, away_team,
+            odds_1, odds_x, odds_2,
+            ou_05_over, ou_05_under, ou_15_over, ou_15_under,
+            ou_25_over, ou_25_under, ou_35_over, ou_35_under,
+            ou_45_over, ou_45_under, ou_55_over, ou_55_under,
+            htft_hh, htft_hd, htft_ha,
+            htft_dh, htft_dd, htft_da,
+            htft_ah, htft_ad, htft_aa,
+            dc_1x, dc_12, dc_x2, gg, ng, source)
+           VALUES (?,?,?,?,?, ?,?,?, ?,?,?,?, ?,?,?,?, ?,?,?,?,
+                   ?,?,?, ?,?,?, ?,?,?, ?,?,?, ?,?, ?)""",
+        (odds.get('round_id'), datetime.now(timezone.utc).isoformat(),
+         odds.get('category', ''), odds.get('home_team', ''), odds.get('away_team', ''),
+         odds.get('odds_1'), odds.get('odds_x'), odds.get('odds_2'),
+         odds.get('ou_05_over'), odds.get('ou_05_under'),
+         odds.get('ou_15_over'), odds.get('ou_15_under'),
+         odds.get('ou_25_over'), odds.get('ou_25_under'),
+         odds.get('ou_35_over'), odds.get('ou_35_under'),
+         odds.get('ou_45_over'), odds.get('ou_45_under'),
+         odds.get('ou_55_over'), odds.get('ou_55_under'),
+         odds.get('htft_hh'), odds.get('htft_hd'), odds.get('htft_ha'),
+         odds.get('htft_dh'), odds.get('htft_dd'), odds.get('htft_da'),
+         odds.get('htft_ah'), odds.get('htft_ad'), odds.get('htft_aa'),
+         odds.get('dc_1x'), odds.get('dc_12'), odds.get('dc_x2'),
+         odds.get('gg'), odds.get('ng'),
+         odds.get('source', 'detail')),
+    )
+    conn.commit()
+    return cursor.lastrowid
