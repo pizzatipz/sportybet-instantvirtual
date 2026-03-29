@@ -2493,8 +2493,9 @@ async def run_scraper(rounds: int = 0, headless: bool = False, manual: bool = Fa
                         print("\n  Observe mode — placing 1 min bet...")
 
                         # Store 1X2 odds from the betting list (free data, no page opens)
-                        from src.db import insert_fixture_odds
+                        from src.db import insert_fixture_odds, insert_market_odds_bulk
                         odds_stored = 0
+                        mkt_records = []
                         for f in fixtures:
                             if f.get('odds_1') and f.get('odds_x') and f.get('odds_2'):
                                 try:
@@ -2509,8 +2510,18 @@ async def run_scraper(rounds: int = 0, headless: bool = False, manual: bool = Fa
                                         'source': 'list',
                                     })
                                     odds_stored += 1
+                                    base = {'round_id': round_id, 'category': f['category'],
+                                            'home_team': f['home_team'], 'away_team': f['away_team']}
+                                    mkt_records.append({**base, 'market': '1X2', 'selection': 'Home', 'odds': f['odds_1']})
+                                    mkt_records.append({**base, 'market': '1X2', 'selection': 'Draw', 'odds': f['odds_x']})
+                                    mkt_records.append({**base, 'market': '1X2', 'selection': 'Away', 'odds': f['odds_2']})
                                 except Exception:
                                     pass
+                        if mkt_records:
+                            try:
+                                insert_market_odds_bulk(conn, mkt_records)
+                            except Exception:
+                                pass
                         if odds_stored:
                             print(f"  Stored 1X2 odds for {odds_stored} fixtures")
                         
@@ -3266,17 +3277,71 @@ async def run_odds_scraper(rounds: int = 1) -> None:
                             'odds_2': f.get('odds_2'),
                             'ou': {k: v for k, v in ou.items()},
                             'htft': {k: v for k, v in htft.items()},
+                            'all_markets': all_odds.get('all_markets', {}),
+                            'dc': all_odds.get('dc', {}),
+                            'gg_ng': all_odds.get('gg_ng', {}),
                         }
                         round_data['fixtures'].append(record)
 
-                        # Compact display
+                        # Store ALL odds into market_odds table
+                        from src.db import get_connection, init_db, insert_market_odds_bulk
+                        odds_records = []
+                        base = {'round_id': round_data['round_id'],
+                                'category': cat, 'home_team': home, 'away_team': away}
+
+                        # 1X2
+                        if f.get('odds_1'):
+                            odds_records.append({**base, 'market': '1X2', 'selection': 'Home', 'odds': f['odds_1']})
+                        if f.get('odds_x'):
+                            odds_records.append({**base, 'market': '1X2', 'selection': 'Draw', 'odds': f['odds_x']})
+                        if f.get('odds_2'):
+                            odds_records.append({**base, 'market': '1X2', 'selection': 'Away', 'odds': f['odds_2']})
+
+                        # O/U all lines
+                        for line, vals in ou.items():
+                            if vals and len(vals) >= 2:
+                                if vals[0]: odds_records.append({**base, 'market': 'O/U', 'selection': f'Over {line}', 'odds': vals[0]})
+                                if vals[1]: odds_records.append({**base, 'market': 'O/U', 'selection': f'Under {line}', 'odds': vals[1]})
+
+                        # HT/FT all 9
+                        for label, val in htft.items():
+                            if val: odds_records.append({**base, 'market': 'HT/FT', 'selection': label, 'odds': val})
+
+                        # DC
+                        for label, val in all_odds.get('dc', {}).items():
+                            if val: odds_records.append({**base, 'market': 'DC', 'selection': label, 'odds': val})
+
+                        # GG/NG
+                        for label, val in all_odds.get('gg_ng', {}).items():
+                            if val: odds_records.append({**base, 'market': 'GG/NG', 'selection': label, 'odds': val})
+
+                        # All other markets (Correct Score, Exact Goals, etc.)
+                        for mkt_name, mkt_data in all_odds.get('all_markets', {}).items():
+                            for item in mkt_data:
+                                if item.get('odds'):
+                                    odds_records.append({**base, 'market': mkt_name, 'selection': item['label'], 'odds': item['odds']})
+
+                        try:
+                            conn_odds = get_connection()
+                            init_db(conn_odds)
+                            stored = insert_market_odds_bulk(conn_odds, odds_records)
+                            conn_odds.close()
+                        except Exception:
+                            stored = 0
+
+                        # Compact display — show AH odds specifically
+                        ah_odds = htft.get('Away/ Home', htft.get('2/1', None))
                         parts = []
+                        if ah_odds is not None:
+                            parts.append(f"AH={ah_odds}")
                         if o25v is not None:
                             parts.append(f"O2.5={o25v}")
-                        if u25 is not None:
-                            parts.append(f"U2.5={u25}")
                         if dd_odds is not None:
                             parts.append(f"DD={dd_odds}")
+                        n_markets = len(all_odds.get('all_markets', {}))
+                        if n_markets > 0:
+                            parts.append(f"+{n_markets}mkts")
+                        parts.append(f"({stored}rec)")
                         display = "  ".join(parts) if parts else "no odds"
                         print(f"    {home} vs {away}: {display}")
 

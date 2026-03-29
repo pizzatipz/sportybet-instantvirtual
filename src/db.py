@@ -145,6 +145,22 @@ def init_db(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_fixture_odds_round ON fixture_odds(round_id);
         CREATE INDEX IF NOT EXISTS idx_fixture_odds_teams ON fixture_odds(category, home_team, away_team);
+
+        CREATE TABLE IF NOT EXISTS market_odds (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            round_id    TEXT,
+            scraped_at  TEXT NOT NULL,
+            category    TEXT NOT NULL,
+            home_team   TEXT NOT NULL,
+            away_team   TEXT NOT NULL,
+            market      TEXT NOT NULL,
+            selection   TEXT NOT NULL,
+            odds        REAL NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_market_odds_round ON market_odds(round_id);
+        CREATE INDEX IF NOT EXISTS idx_market_odds_market ON market_odds(market, selection);
+        CREATE INDEX IF NOT EXISTS idx_market_odds_teams ON market_odds(category, home_team, away_team);
     """)
     conn.commit()
 
@@ -389,6 +405,34 @@ def insert_htft_odds(conn: sqlite3.Connection, odds_data: dict) -> int:
     )
     conn.commit()
     return cursor.lastrowid
+
+
+def insert_market_odds_bulk(conn: sqlite3.Connection, odds_list: list[dict]) -> int:
+    """Insert multiple market odds records in one transaction.
+
+    Each dict should have: round_id, category, home_team, away_team,
+    market, selection, odds.
+    """
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    count = 0
+    for o in odds_list:
+        if o.get('odds') is None or o.get('odds', 0) <= 0:
+            continue
+        conn.execute(
+            """INSERT INTO market_odds
+               (round_id, scraped_at, category, home_team, away_team,
+                market, selection, odds)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (o.get('round_id'), now,
+             o.get('category', ''), o.get('home_team', ''),
+             o.get('away_team', ''),
+             o.get('market', ''), o.get('selection', ''),
+             o.get('odds')),
+        )
+        count += 1
+    conn.commit()
+    return count
 
 
 def insert_htft_odds_bulk(conn: sqlite3.Connection, odds_list: list[dict]) -> int:
