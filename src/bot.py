@@ -1220,17 +1220,18 @@ async def scrape_over_under_odds(page, line: float = 2.5) -> float | None:
 async def scrape_all_market_odds(page) -> dict:
     """Scrape ALL available market odds from a match detail page.
 
-    Returns a dict with:
-    - 'ou': {'0.5': [over, under], '1.5': ..., '2.5': ..., etc.}
-    - 'htft': {'Home/ Home': odds, 'Draw/ Draw': odds, ...}
-    - 'onextwox': {home: odds, draw: odds, away: odds}
-    - 'dc': {'1X': odds, '12': odds, 'X2': odds}
-    - 'gg_ng': {'GG': odds, 'NG': odds}
-    - 'all_markets': {market_name: [{label: odds}, ...]}  (everything else)
+    First scrolls to bottom to ensure all markets are rendered,
+    then captures every market including Correct Score and Exact Goals.
     """
     result = {}
 
     try:
+        # Scroll to bottom to force-render all markets
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await asyncio.sleep(0.5)
+        await page.evaluate("window.scrollTo(0, 0)")
+        await asyncio.sleep(0.3)
+
         data = await page.evaluate(r"""() => {
             const out = { ou: {}, htft: {}, onextwox: {}, dc: {}, gg_ng: {}, all_markets: {} };
 
@@ -3147,10 +3148,14 @@ async def run_odds_scraper(rounds: int = 1) -> None:
     """Dedicated odds-scraping mode.
 
     Opens every fixture on the betting screen and scrapes all O/U, HT/FT,
-    and 1X2 odds. Stores results to a JSON file for analysis.
+    and 1X2 odds. Stores results to DB + JSON for analysis.
     Does NOT place any bets — purely data collection.
     """
     import json
+    from src.db import insert_market_odds_bulk, get_connection as _get_conn, init_db as _init_db
+
+    conn = _get_conn()
+    _init_db(conn)
 
     pw, context, page = await launch_browser(headless=False)
     data_dir = Path(__file__).parent.parent / "data"
@@ -3284,7 +3289,6 @@ async def run_odds_scraper(rounds: int = 1) -> None:
                         round_data['fixtures'].append(record)
 
                         # Store ALL odds into market_odds table
-                        from src.db import get_connection, init_db, insert_market_odds_bulk
                         odds_records = []
                         base = {'round_id': round_data['round_id'],
                                 'category': cat, 'home_team': home, 'away_team': away}
@@ -3322,12 +3326,16 @@ async def run_odds_scraper(rounds: int = 1) -> None:
                                     odds_records.append({**base, 'market': mkt_name, 'selection': item['label'], 'odds': item['odds']})
 
                         try:
-                            conn_odds = get_connection()
-                            init_db(conn_odds)
-                            stored = insert_market_odds_bulk(conn_odds, odds_records)
-                            conn_odds.close()
-                        except Exception:
-                            stored = 0
+                            stored = insert_market_odds_bulk(conn, odds_records)
+                        except Exception as e:
+                            print(f"      DB error: {e}")
+                            # Try reconnecting
+                            try:
+                                conn = _get_conn()
+                                _init_db(conn)
+                                stored = insert_market_odds_bulk(conn, odds_records)
+                            except Exception:
+                                stored = 0
 
                         # Compact display — show AH odds specifically
                         ah_odds = htft.get('Away/ Home', htft.get('2/1', None))
@@ -3401,7 +3409,17 @@ async def run_odds_scraper(rounds: int = 1) -> None:
                         print("  Skipped to result")
                     await asyncio.sleep(2)
                     if await wait_for_results(target, timeout_s=120):
-                        pass
+                        # Also scrape and store match results
+                        try:
+                            from src.db import insert_round, insert_matches_bulk, round_exists
+                            rid, match_list = await scrape_round_results(target)
+                            if match_list and rid and not round_exists(conn, rid):
+                                insert_round(conn, rid)
+                                count = insert_matches_bulk(conn, match_list)
+                                jackpots = sum(1 for m in match_list if _is_jackpot(m))
+                                print(f"  Results: {count} matches, {jackpots} jackpots")
+                        except Exception as e:
+                            print(f"  Results scrape error: {e}")
                     if await click_next_round(target):
                         print("  Next Round!")
                     await asyncio.sleep(3)

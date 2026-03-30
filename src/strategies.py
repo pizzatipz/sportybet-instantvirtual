@@ -1,23 +1,22 @@
 """
-Revised Steady Strategy Engine — Pairing-Based Value Betting
+Jackpot Strategy Engine — Adaptive Value Betting on Away/Home HT/FT
 
-The key insight from rigorous backtesting:
-- The bookmaker prices per-match using team strengths (correlation ~0.53)
-- BUT specific team pairings consistently deviate from the bookmaker's pricing
-- By comparing historical outcome rates PER PAIRING to offered odds,
-  we find fixtures where the bookmaker systematically misprices
+Phase 2 strategy based on 8,683 matches + 1M+ odds records.
 
-This module provides:
-1. compute_pairing_stats() — pre-compute outcome rates for all team pairings
-2. evaluate_fixture() — given a fixture's odds, determine the best +EV bet
-3. learn_from_data() — periodic re-analysis as data accumulates
-4. Bet logging and settlement (unchanged)
+Key findings:
+- Away/Home (jackpot) at 60-75x odds: actual rate 2.71% vs implied 1.50% = +81% EV
+- Away/Home at 75-100x: actual rate 1.60% vs implied 1.16% = +38% EV
+- 100x odds is a TRAP (actual rate 0.28%)
+- Best categories: Champions, Club World Cup, Germany, England
+- HT/FT market margin is 10.2% (not 5%)
+- DC 1-2 (Home or Away wins) at 1.72x: actual 70.2% vs implied 58.2% = +21% EV
 
-Verified from 31,500+ matches × 231 real fixture odds:
-- 97 +EV bets per 3 rounds with n≥10 history filter
-- ~32 +EV bets per round (fits 30-bet cap)
-- Projected profit: NGN +116/round at NGN 10 stake
-- Projected daily (60 rounds): NGN +6,950
+The adaptive system:
+1. Tracks JP rates per category x odds-range from ALL data
+2. Recomputes every LEARN_INTERVAL rounds
+3. Only enables category x range combos with EV > MIN_EV_THRESHOLD
+4. Disables categories/ranges that drop below breakeven
+5. Picks up new edges as they emerge
 """
 
 from __future__ import annotations
@@ -33,116 +32,50 @@ from typing import Optional
 #  CONSTANTS
 # ──────────────────────────────────────────────────────────
 
-# Minimum historical matches for a team pairing before trusting its rate
-MIN_PAIRING_HISTORY = 8
-
-# Maximum bets per round (SportyBet platform limit)
-MAX_BETS_PER_ROUND = 30
-
-# How often to refresh pairing stats (in rounds)
-LEARN_INTERVAL = 20
-
-# Default flat stake
+LEARN_INTERVAL = 10          # Re-analyze every N rounds
+MIN_MATCHES_CATEGORY = 200   # Min matches in a category before trusting rates
+MIN_ODDS_RECORDS = 50        # Min AH odds records for a category x range
+MIN_EV_THRESHOLD = 0.05      # Only bet when EV > 5%
+MAX_BETS_PER_ROUND = 30      # SportyBet limit
 DEFAULT_STAKE = 10.0
 
+# Odds ranges for jackpot analysis
+ODDS_RANGES = [
+    ('50-60', 50, 60),
+    ('60-75', 60, 75),
+    ('75-100', 75, 100),
+]
 
-# ──────────────────────────────────────────────────────────
-#  PAIRING STATS
-# ──────────────────────────────────────────────────────────
-
-def compute_pairing_stats(conn: sqlite3.Connection) -> dict:
-    """Pre-compute outcome rates for every (category, home, away) pairing.
-
-    Returns dict keyed by (category, home_team, away_team) with values:
-    {
-        'n': int,            # number of matches
-        'o25_rate': float,   # Over 2.5 goals rate
-        'u25_rate': float,   # Under 2.5 rate
-        'dd_rate': float,    # Draw/Draw HT/FT rate
-        'draw_rate': float,  # FT Draw rate
-    }
-    """
-    rows = conn.execute('''
-        SELECT category, home_team, away_team,
-               COUNT(*) as n,
-               SUM(CASE WHEN ft_home_goals + ft_away_goals > 2 THEN 1 ELSE 0 END) as o25,
-               SUM(CASE WHEN ft_home_goals + ft_away_goals < 3 THEN 1 ELSE 0 END) as u25,
-               SUM(CASE WHEN htft_result = 'Draw/Draw' THEN 1 ELSE 0 END) as dd,
-               SUM(CASE WHEN ft_result = 'Draw' THEN 1 ELSE 0 END) as draws
-        FROM matches
-        GROUP BY category, home_team, away_team
-    ''').fetchall()
-
-    stats = {}
-    for r in rows:
-        n = r['n']
-        if n < 1:
-            continue
-        key = (r['category'], r['home_team'], r['away_team'])
-        stats[key] = {
-            'n': n,
-            'o25_rate': r['o25'] / n,
-            'u25_rate': r['u25'] / n,
-            'dd_rate': r['dd'] / n,
-            'draw_rate': r['draws'] / n,
-        }
-    return stats
-
-
-def evaluate_fixture(
-    category: str,
-    home_team: str,
-    away_team: str,
-    odds_o25: Optional[float],
-    odds_u25: Optional[float],
-    odds_dd: Optional[float],
-    pairing_stats: dict,
-) -> list[dict]:
-    """Evaluate a fixture's odds against historical pairing rates.
-
-    Returns a list of +EV bet opportunities, sorted by EV descending.
-    Each entry: {'market': str, 'selection': str, 'odds': float,
-                 'rate': float, 'ev': float, 'n': int}
-    """
-    key = (category, home_team, away_team)
-    stats = pairing_stats.get(key)
-
-    if not stats or stats['n'] < MIN_PAIRING_HISTORY:
-        return []
-
-    opportunities = []
-
-    # Over 2.5 — only at very high odds (5.0+) where edge is proven
-    if odds_o25 and odds_o25 >= 5.0:
-        ev = stats['o25_rate'] * odds_o25 - 1
-        if ev > 0:
-            opportunities.append({
-                'market': 'O/U', 'selection': 'Over 2.5',
-                'odds': odds_o25, 'rate': stats['o25_rate'],
-                'ev': ev, 'n': stats['n'],
-                'ui_market': 'O/U', 'ui_selection': 'over_2.5',
-            })
-
-    # Under 2.5 — DROPPED (proven -11.2% ROI across 119 live bets)
-
-    if odds_dd and odds_dd > 0:
-        ev = stats['dd_rate'] * odds_dd - 1
-        if ev > 0:
-            opportunities.append({
-                'market': 'HT/FT', 'selection': 'Draw/Draw',
-                'odds': odds_dd, 'rate': stats['dd_rate'],
-                'ev': ev, 'n': stats['n'],
-                'ui_market': 'HT/FT', 'ui_selection': 'Draw/ Draw',
-            })
-
-    # Sort by EV descending — best opportunity first
-    opportunities.sort(key=lambda x: x['ev'], reverse=True)
-    return opportunities
+# Categories to evaluate (all 8)
+ALL_CATEGORIES = [
+    'England', 'Spain', 'Germany', 'Champions',
+    'Italy', 'African Cup', 'Euros', 'Club World Cup',
+]
 
 
 # ──────────────────────────────────────────────────────────
-#  RUNTIME STATE
+#  ACTIVE MARKET TRACKING
 # ──────────────────────────────────────────────────────────
+
+@dataclass
+class ActiveMarket:
+    """A category x odds-range combo that is currently enabled for betting."""
+    category: str
+    odds_lo: float
+    odds_hi: float
+    range_label: str
+    jp_rate: float        # actual jackpot rate from data
+    implied_rate: float   # bookmaker implied rate (1/avg_odds)
+    avg_odds: float       # average AH odds in this range
+    ev: float             # expected value = jp_rate * avg_odds - 1
+    n_matches: int        # matches used to compute jp_rate
+    n_odds: int           # odds records in this range
+    enabled: bool = True
+
+    @property
+    def ev_pct(self) -> float:
+        return self.ev * 100
+
 
 @dataclass
 class SteadyState:
@@ -206,45 +139,131 @@ class SteadyState:
 
 
 # ──────────────────────────────────────────────────────────
-#  LEARNING / REPORTING
+#  ADAPTIVE LEARNING
 # ──────────────────────────────────────────────────────────
 
 def learn_from_data(conn: sqlite3.Connection) -> dict:
-    """Re-compute pairing stats and generate a report."""
-    total = conn.execute("SELECT COUNT(*) FROM matches").fetchone()[0]
-    total_rounds = conn.execute("SELECT COUNT(*) FROM rounds").fetchone()[0]
-    pairing_stats = compute_pairing_stats(conn)
+    """Analyze ALL data and determine which category x odds-range combos are +EV.
 
-    reliable = {k: v for k, v in pairing_stats.items() if v['n'] >= MIN_PAIRING_HISTORY}
+    Returns a report dict with active_markets list.
+    """
+    total_matches = conn.execute("SELECT COUNT(*) FROM matches").fetchone()[0]
+    total_rounds = conn.execute("SELECT COUNT(*) FROM rounds").fetchone()[0]
+    total_jackpots = conn.execute("SELECT COUNT(*) FROM matches WHERE is_jackpot=1").fetchone()[0]
+
+    if total_matches < 100:
+        return {'status': 'insufficient_data', 'total_matches': total_matches}
+
+    # Get JP rate per category
+    cat_stats = {}
+    for row in conn.execute('''
+        SELECT category, COUNT(*) as n,
+               SUM(CASE WHEN is_jackpot=1 THEN 1 ELSE 0 END) as jp
+        FROM matches GROUP BY category
+    ''').fetchall():
+        cat_stats[row['category']] = {
+            'n': row['n'], 'jp': row['jp'],
+            'rate': row['jp'] / row['n'] if row['n'] > 0 else 0,
+        }
+
+    # Get AH odds distribution per category x range
+    ah_odds = conn.execute('''
+        SELECT category, odds FROM market_odds
+        WHERE market='HT/FT' AND selection IN ('Away/ Home', '2/1', 'Away/Home')
+        AND odds > 0
+    ''').fetchall()
+
+    # Build category x range analysis
+    active_markets = []
+    all_analysis = []
+
+    for cat in ALL_CATEGORIES:
+        cs = cat_stats.get(cat)
+        if not cs or cs['n'] < MIN_MATCHES_CATEGORY:
+            continue
+
+        cat_jp_rate = cs['rate']
+        cat_ah = [r for r in ah_odds if r['category'] == cat]
+
+        for label, lo, hi in ODDS_RANGES:
+            range_odds = [r['odds'] for r in cat_ah if lo <= r['odds'] < hi]
+            if len(range_odds) < MIN_ODDS_RECORDS:
+                continue
+
+            avg_odds = sum(range_odds) / len(range_odds)
+            implied = 1 / avg_odds
+
+            # Use category-wide JP rate (most reliable with our sample sizes)
+            ev = cat_jp_rate * avg_odds - 1
+
+            market = ActiveMarket(
+                category=cat, odds_lo=lo, odds_hi=hi,
+                range_label=label, jp_rate=cat_jp_rate,
+                implied_rate=implied, avg_odds=avg_odds,
+                ev=ev, n_matches=cs['n'], n_odds=len(range_odds),
+                enabled=(ev > MIN_EV_THRESHOLD),
+            )
+            all_analysis.append(market)
+            if market.enabled:
+                active_markets.append(market)
+
+    # Sort active by EV
+    active_markets.sort(key=lambda m: m.ev, reverse=True)
 
     return {
         'status': 'updated',
-        'total_matches': total,
+        'total_matches': total_matches,
         'total_rounds': total_rounds,
-        'total_pairings': len(pairing_stats),
-        'reliable_pairings': len(reliable),
-        'pairing_stats': pairing_stats,
+        'total_jackpots': total_jackpots,
+        'overall_jp_rate': total_jackpots / total_matches if total_matches > 0 else 0,
+        'category_stats': cat_stats,
+        'all_analysis': all_analysis,
+        'active_markets': active_markets,
     }
 
 
+def should_bet_jackpot(category: str, ah_odds: float, active_markets: list) -> Optional[ActiveMarket]:
+    """Check if we should bet Away/Home on this fixture.
+
+    Returns the matching ActiveMarket if +EV, or None.
+    """
+    for m in active_markets:
+        if m.category == category and m.odds_lo <= ah_odds < m.odds_hi and m.enabled:
+            return m
+    return None
+
+
 def print_strategy_report(report: dict) -> None:
-    """Print strategy report."""
+    """Print the adaptive strategy report."""
     if report.get('status') != 'updated':
-        print(f"  Not enough data yet")
+        print(f"  Not enough data ({report.get('total_matches', 0)} matches)")
         return
 
-    print(f"\n  {'=' * 60}")
-    print(f"  STEADY STRATEGY v2 — PAIRING-BASED VALUE BETTING")
+    print(f"\n  {'=' * 65}")
+    print(f"  JACKPOT STRATEGY — ADAPTIVE REPORT")
     print(f"  Data: {report['total_matches']} matches / {report['total_rounds']} rounds")
-    print(f"  Pairings: {report['total_pairings']} total, "
-          f"{report['reliable_pairings']} with n>={MIN_PAIRING_HISTORY}")
-    print(f"  {'=' * 60}")
+    print(f"  Overall JP rate: {report['overall_jp_rate']*100:.2f}%")
+    print(f"  {'=' * 65}")
+
+    print(f"\n  Category JP rates:")
+    for cat, cs in sorted(report['category_stats'].items()):
+        marker = " ✓" if cs['rate'] > 0.015 else ""
+        print(f"    {cat:<18} {cs['rate']*100:.2f}% ({cs['jp']}/{cs['n']}){marker}")
+
+    active = report['active_markets']
+    print(f"\n  Active markets ({len(active)}):")
+    print(f"  {'Category':<18} {'Range':<10} {'AvgOdds':>8} {'JP Rate':>8} {'Implied':>8} {'EV':>8}")
+    for m in active:
+        print(f"  {m.category:<18} {m.range_label:<10} {m.avg_odds:>7.1f} "
+              f"{m.jp_rate*100:>7.2f}% {m.implied_rate*100:>7.2f}% {m.ev_pct:>+7.1f}%")
+
+    print(f"  {'=' * 65}")
 
 
 def print_performance_report(state: SteadyState) -> None:
     """Print runtime performance."""
     print(f"\n  {'=' * 55}")
-    print(f"  STEADY PERFORMANCE")
+    print(f"  JACKPOT PERFORMANCE")
     print(f"  {'=' * 55}")
     print(f"  Bets: {state.total_bets}  Wins: {state.total_wins}  "
           f"WinRate: {state.win_rate*100:.1f}%")
@@ -263,8 +282,7 @@ def print_performance_report(state: SteadyState) -> None:
             ms = state.market_stats[key]
             wr = ms['wins'] / ms['bets'] * 100 if ms['bets'] > 0 else 0
             roi = ms['profit'] / ms['staked'] * 100 if ms['staked'] > 0 else 0
-            print(f"    {key:<20} {ms['bets']:>4} bets  "
-                  f"{wr:>5.1f}% wr  NGN {ms['profit']:>+8.0f}  ROI {roi:>+5.1f}%")
+            print(f"    {key:<30} {ms['bets']:>4}b {wr:>5.1f}%wr NGN {ms['profit']:>+8.0f} ROI {roi:>+5.1f}%")
     print(f"  {'=' * 55}")
 
 
@@ -272,17 +290,8 @@ def print_performance_report(state: SteadyState) -> None:
 #  BET LOGGING AND SETTLEMENT
 # ──────────────────────────────────────────────────────────
 
-def log_bet(
-    conn: sqlite3.Connection,
-    round_id: Optional[str],
-    category: str,
-    home_team: str,
-    away_team: str,
-    market: str,
-    selection: str,
-    odds: float,
-    stake: float,
-) -> int:
+def log_bet(conn, round_id, category, home_team, away_team,
+            market, selection, odds, stake) -> int:
     """Log a pending bet. Returns row id."""
     cursor = conn.execute(
         """INSERT INTO bets
@@ -296,7 +305,7 @@ def log_bet(
     return cursor.lastrowid
 
 
-def settle_bets(conn: sqlite3.Connection, round_id: str, matches: list[dict]) -> dict:
+def settle_bets(conn, round_id, matches) -> dict:
     """Settle unsettled bets against actual results."""
     from src.db import derive_htft
 
@@ -326,17 +335,12 @@ def settle_bets(conn: sqlite3.Connection, round_id: str, matches: list[dict]) ->
             match['ht_home_goals'], match['ht_away_goals'],
             match['ft_home_goals'], match['ft_away_goals'],
         )
-        total_goals = match['ft_home_goals'] + match['ft_away_goals']
 
         won = False
-        if bet['market'] == 'HT/FT' and bet['selection'] == 'Draw/Draw':
-            won = htft == 'Draw/Draw'
-        elif bet['market'] == 'O/U' and bet['selection'] == 'Over 2.5':
-            won = total_goals > 2
-        elif bet['market'] == 'O/U' and bet['selection'] == 'Under 2.5':
-            won = total_goals < 3
-        elif bet['market'] == 'HT/FT' and bet['selection'] == 'Away/Home':
+        if bet['market'] == 'HT/FT' and bet['selection'] in ('Away/Home', 'Away/ Home'):
             won = htft == 'Away/Home'
+        elif bet['market'] == 'DC' and bet['selection'] == '12':
+            won = match['ft_result'] in ('Home', 'Away')
 
         payout = bet['odds'] * bet['stake'] if won else 0.0
         profit = payout - bet['stake']
@@ -354,7 +358,7 @@ def settle_bets(conn: sqlite3.Connection, round_id: str, matches: list[dict]) ->
     return {'settled': settled, 'wins': wins, 'losses': settled - wins, 'profit': total_profit}
 
 
-def get_session_stats(conn: sqlite3.Connection) -> dict:
+def get_session_stats(conn) -> dict:
     """Get aggregate bet stats."""
     row = conn.execute("""
         SELECT COUNT(*) as total,

@@ -417,20 +417,28 @@ def insert_market_odds_bulk(conn: sqlite3.Connection, odds_list: list[dict]) -> 
     now = datetime.now(timezone.utc).isoformat()
     count = 0
     for o in odds_list:
-        if o.get('odds') is None or o.get('odds', 0) <= 0:
+        if not o.get('odds') or not o.get('market') or not o.get('selection'):
             continue
-        conn.execute(
-            """INSERT INTO market_odds
-               (round_id, scraped_at, category, home_team, away_team,
-                market, selection, odds)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (o.get('round_id'), now,
-             o.get('category', ''), o.get('home_team', ''),
-             o.get('away_team', ''),
-             o.get('market', ''), o.get('selection', ''),
-             o.get('odds')),
-        )
-        count += 1
+        try:
+            odds_val = float(o['odds'])
+            if odds_val <= 0:
+                continue
+        except (ValueError, TypeError):
+            continue
+        try:
+            conn.execute(
+                """INSERT INTO market_odds
+                   (round_id, scraped_at, category, home_team, away_team,
+                    market, selection, odds)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (o.get('round_id'), now,
+                 o.get('category', ''), o.get('home_team', ''),
+                 o.get('away_team', ''),
+                 o['market'], o['selection'], odds_val),
+            )
+            count += 1
+        except Exception:
+            continue
     conn.commit()
     return count
 
