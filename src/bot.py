@@ -2170,16 +2170,15 @@ async def run_scraper(rounds: int = 0, headless: bool = False, manual: bool = Fa
         if steady_mode:
             from src.strategies import (
                 learn_from_data as steady_learn, print_strategy_report,
-                compute_pairing_stats, evaluate_fixture,
-                settle_bets, SteadyState,
+                should_bet_jackpot, settle_bets, SteadyState,
                 LEARN_INTERVAL as STEADY_LEARN_INTERVAL,
                 print_performance_report, MAX_BETS_PER_ROUND,
                 log_bet,
             )
-            print("\n  Loading Steady v2 strategy (pairing-based)...")
+            print("\n  Loading Jackpot strategy...")
             strategy_report = steady_learn(conn)
             print_strategy_report(strategy_report)
-            pairing_stats = strategy_report.get('pairing_stats', {})
+            active_markets = strategy_report.get('active_markets', [])
             steady_state = SteadyState()
         else:
             print("\n  Loading strategy from historical data...")
@@ -2191,10 +2190,10 @@ async def run_scraper(rounds: int = 0, headless: bool = False, manual: bool = Fa
             # ── Periodic re-learning ─────────────────────────────
             if rounds_scraped > 0 and rounds_scraped % LEARN_INTERVAL == 0:
                 if steady_mode:
-                    print("\n  Re-learning pairing stats...")
+                    print("\n  Re-learning jackpot strategy...")
                     strategy_report = steady_learn(conn)
                     print_strategy_report(strategy_report)
-                    pairing_stats = strategy_report.get('pairing_stats', {})
+                    active_markets = strategy_report.get('active_markets', [])
                     print_performance_report(steady_state)
                 else:
                     print("\n  Re-learning strategy from updated data...")
@@ -2250,42 +2249,37 @@ async def run_scraper(rounds: int = 0, headless: bool = False, manual: bool = Fa
                             target, fixtures, selection="Away/ Home"
                         )
                     elif steady_mode:
-                        # Steady v2: pairing-based value betting
-                        # Scan ALL fixtures for odds data (valuable for research)
-                        # Only bet on fixtures with sufficient history
+                        # Jackpot strategy: scan fixtures for AH odds in +EV ranges
                         from collections import defaultdict as _dd2
+                        from src.db import insert_market_odds_bulk
 
                         by_cat = _dd2(list)
                         for f in fixtures:
                             by_cat[f['category']].append(f)
 
-                        print(f"\n  Steady v2: scanning all {len(fixtures)} fixtures for odds")
-
-                        # Store 1X2 odds from the betting list (free data)
-                        from src.db import insert_fixture_odds
+                        # Store 1X2 odds from list (free data)
+                        mkt_records = []
                         for f in fixtures:
                             if f.get('odds_1') and f.get('odds_x') and f.get('odds_2'):
-                                try:
-                                    insert_fixture_odds(conn, {
-                                        'round_id': round_id,
-                                        'category': f['category'],
-                                        'home_team': f['home_team'],
-                                        'away_team': f['away_team'],
-                                        'odds_1': f['odds_1'],
-                                        'odds_x': f['odds_x'],
-                                        'odds_2': f['odds_2'],
-                                        'source': 'list',
-                                    })
-                                except Exception:
-                                    pass
+                                base = {'round_id': round_id, 'category': f['category'],
+                                        'home_team': f['home_team'], 'away_team': f['away_team']}
+                                mkt_records.append({**base, 'market': '1X2', 'selection': 'Home', 'odds': f['odds_1']})
+                                mkt_records.append({**base, 'market': '1X2', 'selection': 'Draw', 'odds': f['odds_x']})
+                                mkt_records.append({**base, 'market': '1X2', 'selection': 'Away', 'odds': f['odds_2']})
+                        if mkt_records:
+                            try:
+                                insert_market_odds_bulk(conn, mkt_records)
+                            except Exception:
+                                pass
 
-                        all_opportunities = []  # (ev, fixture_dict, bet_info)
+                        print(f"\n  Jackpot scan: {len(fixtures)} fixtures, "
+                              f"{len(active_markets)} active markets")
+
+                        qualified_bets = []  # (ev, category, home, away, ah_odds, market_obj)
                         steady_state.start_round()
-                        cats_scanned = 0
 
                         for cat in sorted(by_cat.keys()):
                             cat_fixtures = by_cat[cat]
-                            # Click category tab
                             await dismiss_dialogs(target)
                             await target.evaluate(r"""(catName) => {
                                 const tabs = document.querySelectorAll('li.sport-type-item');
@@ -2303,7 +2297,7 @@ async def run_scraper(rounds: int = 0, headless: bool = False, manual: bool = Fa
                                 away = f['away_team']
                                 await dismiss_dialogs(target)
 
-                                # Click fixture to open detail
+                                # Open fixture detail
                                 try:
                                     clicked = await target.evaluate(r"""(args) => {
                                         const [home, away] = args;
@@ -2336,32 +2330,55 @@ async def run_scraper(rounds: int = 0, headless: bool = False, manual: bool = Fa
                                     await asyncio.sleep(0.5)
                                     continue
 
-                                # Scrape all odds
+                                # Scrape all odds (for data collection)
                                 try:
                                     all_odds = await scrape_all_market_odds(target)
                                 except Exception:
                                     all_odds = {}
 
-                                ou = all_odds.get('ou', {})
+                                # Store all odds to DB
                                 htft = all_odds.get('htft', {})
-                                line25 = ou.get('2.5', [None, None])
-                                odds_o25 = line25[0] if line25 and len(line25) > 0 else None
-                                odds_u25 = line25[1] if line25 and len(line25) > 1 else None
-                                odds_dd = htft.get('Draw/ Draw') or htft.get('X/X')
+                                ou = all_odds.get('ou', {})
+                                odds_recs = []
+                                base = {'round_id': round_id, 'category': cat,
+                                        'home_team': home, 'away_team': away}
+                                for label, val in htft.items():
+                                    if val:
+                                        odds_recs.append({**base, 'market': 'HT/FT',
+                                                         'selection': label, 'odds': val})
+                                for line, vals in ou.items():
+                                    if vals and len(vals) >= 2:
+                                        if vals[0]:
+                                            odds_recs.append({**base, 'market': 'O/U',
+                                                             'selection': f'Over {line}', 'odds': vals[0]})
+                                        if vals[1]:
+                                            odds_recs.append({**base, 'market': 'O/U',
+                                                             'selection': f'Under {line}', 'odds': vals[1]})
+                                for mkt_name, mkt_data in all_odds.get('all_markets', {}).items():
+                                    for item in mkt_data:
+                                        if item.get('odds'):
+                                            odds_recs.append({**base, 'market': mkt_name,
+                                                             'selection': item['label'],
+                                                             'odds': item['odds']})
+                                if odds_recs:
+                                    try:
+                                        insert_market_odds_bulk(conn, odds_recs)
+                                    except Exception:
+                                        pass
 
-                                # Evaluate using pairing stats
-                                opps = evaluate_fixture(
-                                    cat, home, away,
-                                    odds_o25, odds_u25, odds_dd,
-                                    pairing_stats,
-                                )
-
-                                if opps:
-                                    best = opps[0]
-                                    all_opportunities.append((best['ev'], f, best))
-                                    info = f"O2.5={odds_o25} U2.5={odds_u25} DD={odds_dd}"
-                                    print(f"    {home}v{away} ({cat}): {info} -> "
-                                          f"{best['selection']}@{best['odds']:.2f} EV={best['ev']*100:+.0f}%")
+                                # Check AH odds for jackpot bet
+                                ah_odds_val = htft.get('Away/ Home') or htft.get('2/1')
+                                if ah_odds_val:
+                                    m = should_bet_jackpot(cat, ah_odds_val, active_markets)
+                                    if m:
+                                        qualified_bets.append(
+                                            (m.ev, cat, home, away, ah_odds_val, m))
+                                        print(f"    {home}v{away} ({cat}): AH@{ah_odds_val:.1f} "
+                                              f"EV={m.ev_pct:+.0f}% QUALIFIED")
+                                    else:
+                                        print(f"    {home}v{away} ({cat}): AH@{ah_odds_val:.1f} skip")
+                                else:
+                                    print(f"    {home}v{away} ({cat}): no AH odds")
 
                                 # Go back
                                 await go_back_to_betting(target)
@@ -2375,39 +2392,19 @@ async def run_scraper(rounds: int = 0, headless: bool = False, manual: bool = Fa
                                     await go_back_to_betting(target)
                                     await asyncio.sleep(0.5)
 
-                            # Free iframe memory after each category
-                            cats_scanned += 1
-                            if cats_scanned % 4 == 0:
-                                try:
-                                    await target.evaluate("window.gc && window.gc()")
-                                except Exception:
-                                    pass
+                        # Sort by EV and place bets
+                        qualified_bets.sort(key=lambda x: x[0], reverse=True)
+                        to_bet = qualified_bets[:MAX_BETS_PER_ROUND]
+                        print(f"\n  {len(qualified_bets)} qualified, "
+                              f"betting top {len(to_bet)}")
 
-                        # Sort by EV and take top 30
-                        all_opportunities.sort(key=lambda x: x[0], reverse=True)
-                        to_bet = all_opportunities[:MAX_BETS_PER_ROUND]
-                        print(f"\n  Found {len(all_opportunities)} +EV opportunities, "
-                              f"betting on top {len(to_bet)}")
-
-                        # Now place bets (cap at 28 to leave headroom for stale bets)
                         steady_bets = 0
                         bet_failures = 0
-                        for ev_val, fix, bet_info in to_bet:
-                            if steady_bets >= 28:
-                                break
-                            # If 3 consecutive failures, betslip may be full
+                        for ev_val, cat, home, away, ah_odds_val, mkt in to_bet:
                             if bet_failures >= 3:
-                                print("  3 consecutive bet failures — betslip may be full, stopping")
+                                print("  3 consecutive failures, stopping")
                                 break
 
-                            cat = fix['category']
-                            home = fix['home_team']
-                            away = fix['away_team']
-                            sel = bet_info['selection']
-                            odds_val = bet_info['odds']
-                            mkt = bet_info['market']
-
-                            # Navigate to category
                             await dismiss_dialogs(target)
                             await target.evaluate(r"""(catName) => {
                                 const tabs = document.querySelectorAll('li.sport-type-item');
@@ -2425,12 +2422,14 @@ async def run_scraper(rounds: int = 0, headless: bool = False, manual: bool = Fa
                                     target, cat, home, away,
                                     market_config=None, conn=conn,
                                     round_id=round_id, stake=10.0,
-                                    bet_override={'market': bet_info['ui_market'],
-                                                  'selection': bet_info['ui_selection'],
-                                                  'min_odds': 0,
-                                                  'db_market': mkt,
-                                                  'db_selection': sel,
-                                                  'odds': odds_val},
+                                    bet_override={
+                                        'market': 'HT/FT',
+                                        'selection': 'Away/ Home',
+                                        'min_odds': 0,
+                                        'db_market': 'HT/FT',
+                                        'db_selection': 'Away/Home',
+                                        'odds': ah_odds_val,
+                                    },
                                 )
                             except Exception as e:
                                 print(f"    Error: {e}")
@@ -2442,18 +2441,15 @@ async def run_scraper(rounds: int = 0, headless: bool = False, manual: bool = Fa
                             if bet_result:
                                 steady_bets += 1
                                 bet_failures = 0
-                                print(f"    {sel} {home}v{away} @{odds_val:.2f} "
+                                print(f"    AH {home}v{away} @{ah_odds_val:.1f} "
                                       f"EV={ev_val*100:+.0f}% CONFIRMED")
                             else:
                                 bet_failures += 1
 
-                            if steady_bets >= 28:
-                                break
-
-                        print(f"\n  {steady_bets} bets placed this round")
+                        print(f"\n  {steady_bets} jackpot bets placed")
 
                         if steady_bets == 0:
-                            print("  No bets placed. Observing...")
+                            print("  No jackpot bets qualified. Placing 1 observe bet...")
                             if await open_fixture_detail(target, 0):
                                 await select_htft_outcome(target, "Away/ Home")
                                 await asyncio.sleep(1)
