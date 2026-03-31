@@ -2805,13 +2805,19 @@ async def run_scraper(rounds: int = 0, headless: bool = False, manual: bool = Fa
                         # ── Scrape HT/FT odds from each fixture's detail page ──
                         # This is critical for the research — we need Away/Home odds
                         # to test the 55-75x bracket hypothesis.
+                        # Global timeout: 300s (5 min) for all fixtures. If it hangs, skip rest.
                         from collections import defaultdict as _dd_obs
                         by_cat_obs = _dd_obs(list)
                         for f in fixtures:
                             by_cat_obs[f['category']].append(f)
 
                         htft_odds_count = 0
+                        odds_scrape_start = asyncio.get_event_loop().time()
                         for cat in sorted(by_cat_obs.keys()):
+                            # Check global timeout (5 min max for all odds scraping)
+                            if asyncio.get_event_loop().time() - odds_scrape_start > 300:
+                                print("  ⏰ HT/FT odds scraping timeout (5 min) — moving on")
+                                break
                             cat_fixtures = by_cat_obs[cat]
                             # Click category tab
                             try:
@@ -2830,6 +2836,9 @@ async def run_scraper(rounds: int = 0, headless: bool = False, manual: bool = Fa
                                 continue
 
                             for fi, f in enumerate(cat_fixtures):
+                                # Per-fixture timeout check
+                                if asyncio.get_event_loop().time() - odds_scrape_start > 300:
+                                    break
                                 home = f['home_team']
                                 away = f['away_team']
                                 try:
@@ -2854,10 +2863,12 @@ async def run_scraper(rounds: int = 0, headless: bool = False, manual: bool = Fa
                                     await asyncio.sleep(1.0)
                                     await dismiss_dialogs(target)
 
-                                    # Scrape all market odds from detail page
+                                    # Scrape all market odds from detail page (10s timeout)
                                     try:
-                                        all_odds = await scrape_all_market_odds(target)
-                                    except Exception:
+                                        all_odds = await asyncio.wait_for(
+                                            scrape_all_market_odds(target), timeout=10.0
+                                        )
+                                    except (asyncio.TimeoutError, Exception):
                                         all_odds = {}
 
                                     # Store HT/FT and other market odds
