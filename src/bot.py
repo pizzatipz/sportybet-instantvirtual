@@ -2801,8 +2801,112 @@ async def run_scraper(rounds: int = 0, headless: bool = False, manual: bool = Fa
                                 pass
                         if odds_stored:
                             print(f"  Stored 1X2 odds for {odds_stored} fixtures")
+
+                        # ── Scrape HT/FT odds from each fixture's detail page ──
+                        # This is critical for the research — we need Away/Home odds
+                        # to test the 55-75x bracket hypothesis.
+                        from collections import defaultdict as _dd_obs
+                        by_cat_obs = _dd_obs(list)
+                        for f in fixtures:
+                            by_cat_obs[f['category']].append(f)
+
+                        htft_odds_count = 0
+                        for cat in sorted(by_cat_obs.keys()):
+                            cat_fixtures = by_cat_obs[cat]
+                            # Click category tab
+                            try:
+                                await dismiss_dialogs(target)
+                                await target.evaluate(r"""(catName) => {
+                                    const tabs = document.querySelectorAll('li.sport-type-item');
+                                    for (const tab of tabs) {
+                                        if ((tab.textContent || '').trim() === catName) {
+                                            tab.click(); return true;
+                                        }
+                                    }
+                                    return false;
+                                }""", cat)
+                                await asyncio.sleep(0.8)
+                            except Exception:
+                                continue
+
+                            for fi, f in enumerate(cat_fixtures):
+                                home = f['home_team']
+                                away = f['away_team']
+                                try:
+                                    await dismiss_dialogs(target)
+                                    clicked = await target.evaluate(r"""(args) => {
+                                        const [home, away] = args;
+                                        const cells = document.querySelectorAll(
+                                            '.event-list .teams-cell, .teams-info-wrap'
+                                        );
+                                        for (const cell of cells) {
+                                            const txt = cell.textContent || '';
+                                            if (txt.includes(home) && txt.includes(away)) {
+                                                cell.scrollIntoView({behavior:'instant', block:'center'});
+                                                cell.click();
+                                                return true;
+                                            }
+                                        }
+                                        return false;
+                                    }""", [home, away])
+                                    if not clicked:
+                                        continue
+                                    await asyncio.sleep(1.0)
+                                    await dismiss_dialogs(target)
+
+                                    # Scrape all market odds from detail page
+                                    try:
+                                        all_odds = await scrape_all_market_odds(target)
+                                    except Exception:
+                                        all_odds = {}
+
+                                    # Store HT/FT and other market odds
+                                    if all_odds:
+                                        odds_recs = []
+                                        base_rec = {
+                                            'round_id': round_id, 'category': cat,
+                                            'home_team': home, 'away_team': away
+                                        }
+                                        htft = all_odds.get('htft', {})
+                                        for sel, odd_val in htft.items():
+                                            if odd_val:
+                                                odds_recs.append({
+                                                    **base_rec, 'market': 'HT/FT',
+                                                    'selection': sel, 'odds': float(odd_val)
+                                                })
+                                        ou = all_odds.get('ou', {})
+                                        for line, vals in ou.items():
+                                            if vals and len(vals) >= 2:
+                                                if vals[0]:
+                                                    odds_recs.append({
+                                                        **base_rec, 'market': f'O/U {line}',
+                                                        'selection': 'Over', 'odds': float(vals[0])
+                                                    })
+                                                if vals[1]:
+                                                    odds_recs.append({
+                                                        **base_rec, 'market': f'O/U {line}',
+                                                        'selection': 'Under', 'odds': float(vals[1])
+                                                    })
+                                        if odds_recs:
+                                            try:
+                                                insert_market_odds_bulk(conn, odds_recs)
+                                                htft_odds_count += len([r for r in odds_recs if r['market'] == 'HT/FT'])
+                                            except Exception:
+                                                pass
+
+                                    await go_back_to_betting(target)
+                                    await asyncio.sleep(0.5)
+                                except Exception:
+                                    try:
+                                        await go_back_to_betting(target)
+                                    except Exception:
+                                        pass
+                                    continue
+
+                        if htft_odds_count:
+                            print(f"  📊 Stored {htft_odds_count} HT/FT odds across all fixtures")
                         
-                        # Open first fixture
+                        # ── Place 1 throwaway bet to trigger results ──
                         if await open_fixture_detail(target, 0):
                             # Select Away/Home
                             await select_htft_outcome(target, "Away/ Home")
