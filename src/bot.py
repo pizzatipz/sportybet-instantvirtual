@@ -13,6 +13,7 @@ import argparse
 import asyncio
 import sys
 import re
+import os
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -22,6 +23,21 @@ from src.db import (
     get_connection, init_db, insert_round, insert_matches_bulk,
     round_exists, get_total_stats, CATEGORIES, insert_htft_odds_bulk,
 )
+
+# ──────────────────────────────────────────────────────────
+#  AUTO-LOGIN CREDENTIALS (loaded from environment / .env)
+# ──────────────────────────────────────────────────────────
+# Load .env file if present (for local dev / server deployment)
+_env_path = Path(__file__).parent.parent / ".env"
+if _env_path.exists():
+    for line in _env_path.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, _, val = line.partition("=")
+            os.environ.setdefault(key.strip(), val.strip())
+
+SPORTYBET_PHONE = os.environ.get("SPORTYBET_PHONE", "")
+SPORTYBET_PASSWORD = os.environ.get("SPORTYBET_PASSWORD", "")
 
 # Persistent browser profile directory
 PROFILE_DIR = Path(__file__).parent.parent / "data" / "browser_profile"
@@ -294,6 +310,127 @@ async def launch_browser(headless: bool = False, persistent: bool = True) -> tup
     return pw, context, page
 
 
+async def auto_login(page: Page) -> bool:
+    """Attempt automatic login to SportyBet using credentials from environment.
+
+    Flow:
+    1. Click the Login button on the main page
+    2. Wait for the login form to appear
+    3. Enter phone number and password
+    4. Submit the form
+    5. Wait for session to establish (NGN balance visible)
+
+    Returns True if login succeeded, False if failed or credentials not set.
+    """
+    if not SPORTYBET_PHONE or not SPORTYBET_PASSWORD:
+        print("⚠️  Auto-login: No credentials set (SPORTYBET_PHONE / SPORTYBET_PASSWORD)")
+        return False
+
+    print("🔐 Attempting auto-login...")
+
+    try:
+        # Step 1: Click the Login / Register button to open the form
+        login_btn = await page.query_selector(
+            'button.login-btn, [class*="login-btn"], '
+            'a[href*="login"], button:has-text("Log In"), '
+            'button:has-text("Login"), span:has-text("Log In"), '
+            '[class*="af-header-login"]'
+        )
+        if login_btn:
+            await login_btn.click()
+            print("   Clicked login button")
+            await asyncio.sleep(2)
+        else:
+            # Maybe login form is already visible (e.g. after session expiry popup)
+            print("   No login button found — checking if form is already open")
+
+        # Step 2: Wait for the phone input to appear
+        phone_input = None
+        for _ in range(10):
+            phone_input = await page.query_selector(
+                'input[placeholder*="Mobile"], input[placeholder*="Phone"], '
+                'input[placeholder*="phone"], input[placeholder*="mobile"], '
+                'input[type="tel"], #loginStep input[type="text"], '
+                'input[name="phone"], input[name="mobile"]'
+            )
+            if phone_input:
+                break
+            await asyncio.sleep(1)
+
+        if not phone_input:
+            print("   ❌ Phone input not found after 10 seconds")
+            return False
+
+        # Step 3: Clear and type phone number
+        await phone_input.click()
+        await phone_input.fill("")
+        await asyncio.sleep(0.3)
+        await phone_input.fill(SPORTYBET_PHONE)
+        print(f"   Entered phone: {'*' * (len(SPORTYBET_PHONE) - 4)}{SPORTYBET_PHONE[-4:]}")
+        await asyncio.sleep(0.5)
+
+        # Step 4: Find and fill password input
+        password_input = await page.query_selector(
+            'input[type="password"], input[placeholder*="Password"], '
+            'input[placeholder*="password"], input[name="password"]'
+        )
+        if not password_input:
+            print("   ❌ Password input not found")
+            return False
+
+        await password_input.click()
+        await password_input.fill("")
+        await asyncio.sleep(0.3)
+        await password_input.fill(SPORTYBET_PASSWORD)
+        print("   Entered password: ********")
+        await asyncio.sleep(0.5)
+
+        # Step 5: Click the submit / login button inside the form
+        submit_btn = await page.query_selector(
+            '#loginStep button[type="submit"], '
+            '#loginStep button.login-submit, '
+            'button:has-text("Log In"), button:has-text("LOGIN"), '
+            'button:has-text("Sign In"), '
+            '.m-dialog-main button[type="submit"], '
+            'form button[type="submit"]'
+        )
+        if submit_btn:
+            await submit_btn.click()
+            print("   Clicked submit button")
+        else:
+            # Try pressing Enter as fallback
+            await password_input.press("Enter")
+            print("   Pressed Enter to submit")
+
+        # Step 6: Wait for login to complete (check for NGN balance)
+        print("   Waiting for session to establish...")
+        for i in range(30):  # ~30 seconds max
+            await asyncio.sleep(1)
+            if await _check_logged_in(page):
+                print("✅ Auto-login successful!")
+                return True
+            # Check for error messages (wrong password, etc.)
+            error = await page.evaluate("""() => {
+                const els = document.querySelectorAll('.error, .alert, [class*="error"], [class*="alert"]');
+                for (const el of els) {
+                    if (el.offsetHeight > 0 && el.textContent.trim().length > 0) {
+                        return el.textContent.trim();
+                    }
+                }
+                return null;
+            }""")
+            if error and i > 3:  # give it a few seconds before checking errors
+                print(f"   ⚠️ Login error: {error}")
+                return False
+
+        print("   ❌ Auto-login timed out after 30 seconds")
+        return False
+
+    except Exception as e:
+        print(f"   ❌ Auto-login failed: {e}")
+        return False
+
+
 async def wait_for_login(page: Page):
     """Navigate to SportyBet, handle login if needed, and return the
     iframe Frame containing the virtual soccer content.
@@ -319,15 +456,11 @@ async def wait_for_login(page: Page):
         print("✅ Already logged in (session from persistent profile).")
     else:
         print("\n⚠️  Not logged in.")
-        print("   Please log in using the browser window that opened.")
-        print("   (Your session will be saved for future runs.)")
-        print("\n   Waiting for login...")
 
-        # Poll until the user logs in (check every 3 seconds)
-        for _ in range(200):  # ~10 min max wait
-            await asyncio.sleep(3)
-            if await _check_logged_in(page):
-                print("✅ Login detected!")
+        # Attempt auto-login first if credentials are available
+        if SPORTYBET_PHONE and SPORTYBET_PASSWORD:
+            login_ok = await auto_login(page)
+            if login_ok:
                 # Reload page to pick up authenticated state
                 await page.goto(
                     SPORTYBET_VIRTUALS_URL,
@@ -335,7 +468,42 @@ async def wait_for_login(page: Page):
                     timeout=30000,
                 )
                 await asyncio.sleep(3)
-                break
+            else:
+                print("   Auto-login failed. Falling back to manual login.")
+                print("   Please log in using the browser window.")
+                print("\n   Waiting for login...")
+                for _ in range(200):
+                    await asyncio.sleep(3)
+                    if await _check_logged_in(page):
+                        print("✅ Login detected!")
+                        await page.goto(
+                            SPORTYBET_VIRTUALS_URL,
+                            wait_until="domcontentloaded",
+                            timeout=30000,
+                        )
+                        await asyncio.sleep(3)
+                        break
+                else:
+                    print("❌ Login timed out. Please restart and try again.")
+                    raise SystemExit(1)
+        else:
+            print("   No auto-login credentials set.")
+            print("   Please log in using the browser window.")
+            print("   (Your session will be saved for future runs.)")
+            print("\n   Waiting for login...")
+
+            # Poll until the user logs in (check every 3 seconds)
+            for _ in range(200):  # ~10 min max wait
+                await asyncio.sleep(3)
+                if await _check_logged_in(page):
+                    print("✅ Login detected!")
+                    await page.goto(
+                        SPORTYBET_VIRTUALS_URL,
+                        wait_until="domcontentloaded",
+                        timeout=30000,
+                    )
+                    await asyncio.sleep(3)
+                    break
         else:
             print("❌ Login timed out. Please restart and try again.")
             raise SystemExit(1)
@@ -2148,13 +2316,32 @@ async def check_session_alive(page: Page, target) -> bool:
 async def handle_session_expired(page: Page) -> bool:
     """Handle a detected session expiry.
 
-    Waits for the user to re-login, then returns True when session is restored.
-    Returns False if user doesn't re-login within the timeout.
+    Attempts auto-login first if credentials are available.
+    Falls back to waiting for manual re-login.
+    Returns True when session is restored, False on timeout.
     """
     print("\n" + "!" * 50)
-    print("⚠️  SESSION EXPIRED — Please log in again in the browser.")
+    print("⚠️  SESSION EXPIRED")
     print("!" * 50)
 
+    # Attempt auto-login first
+    if SPORTYBET_PHONE and SPORTYBET_PASSWORD:
+        print("🔐 Attempting auto-login to restore session...")
+        # Navigate to main page first (iframe context won't have login form)
+        await page.goto(SPORTYBET_VIRTUALS_URL, wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(2)
+
+        if await auto_login(page):
+            await page.goto(
+                SPORTYBET_VIRTUALS_URL,
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+            await asyncio.sleep(3)
+            return True
+        print("   Auto-login failed, waiting for manual re-login...")
+
+    print("   Please log in again in the browser.")
     for _ in range(200):  # ~10 min
         await asyncio.sleep(3)
         if await _check_logged_in(page):
