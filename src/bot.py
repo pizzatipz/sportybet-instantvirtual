@@ -2806,17 +2806,20 @@ async def run_scraper(rounds: int = 0, headless: bool = False, manual: bool = Fa
                         # This is critical for the research — we need Away/Home odds
                         # to test the 55-75x bracket hypothesis.
                         # Global timeout: 300s (5 min) for all fixtures. If it hangs, skip rest.
+                        import time as _time
                         from collections import defaultdict as _dd_obs
                         by_cat_obs = _dd_obs(list)
                         for f in fixtures:
                             by_cat_obs[f['category']].append(f)
 
                         htft_odds_count = 0
-                        odds_scrape_start = asyncio.get_event_loop().time()
+                        odds_scrape_start = _time.monotonic()
+                        odds_scrape_aborted = False
                         for cat in sorted(by_cat_obs.keys()):
                             # Check global timeout (5 min max for all odds scraping)
-                            if asyncio.get_event_loop().time() - odds_scrape_start > 300:
+                            if _time.monotonic() - odds_scrape_start > 300:
                                 print("  ⏰ HT/FT odds scraping timeout (5 min) — moving on")
+                                odds_scrape_aborted = True
                                 break
                             cat_fixtures = by_cat_obs[cat]
                             # Click category tab
@@ -2837,7 +2840,8 @@ async def run_scraper(rounds: int = 0, headless: bool = False, manual: bool = Fa
 
                             for fi, f in enumerate(cat_fixtures):
                                 # Per-fixture timeout check
-                                if asyncio.get_event_loop().time() - odds_scrape_start > 300:
+                                if _time.monotonic() - odds_scrape_start > 300:
+                                    odds_scrape_aborted = True
                                     break
                                 home = f['home_team']
                                 away = f['away_team']
@@ -2861,7 +2865,7 @@ async def run_scraper(rounds: int = 0, headless: bool = False, manual: bool = Fa
                                     if not clicked:
                                         continue
                                     await asyncio.sleep(1.0)
-                                    await dismiss_dialogs(target)
+                                    await asyncio.wait_for(dismiss_dialogs(target), timeout=5.0)
 
                                     # Scrape all market odds from detail page (10s timeout)
                                     try:
