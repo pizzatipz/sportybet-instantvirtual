@@ -1,22 +1,24 @@
 """
 Jackpot Strategy Engine — Adaptive Value Betting on Away/Home HT/FT
 
-Phase 2 strategy based on 8,683 matches + 1M+ odds records.
+Phase 3 strategy based on 9,751 matches deep dive.
 
 Key findings:
-- Away/Home (jackpot) at 60-75x odds: actual rate 2.71% vs implied 1.50% = +81% EV
-- Away/Home at 75-100x: actual rate 1.60% vs implied 1.16% = +38% EV
-- 100x odds is a TRAP (actual rate 0.28%)
-- Best categories: Champions, Club World Cup, Germany, England
-- HT/FT market margin is 10.2% (not 5%)
-- DC 1-2 (Home or Away wins) at 1.72x: actual 70.2% vs implied 58.2% = +21% EV
+- Away/Home overall rate: 1.57% (fair odds = 63.7x)
+- Odds above 65x are -EV traps (house edge too large)
+- Only 3 categories have AH rate >= 1.8%:
+    Germany 2.22% (fair=45x), Champions 2.00% (fair=50x),
+    Club World Cup 1.88% (fair=53x)
+- All other categories (England 1.47%, Spain 1.48%, Euros 1.44%,
+    African Cup 1.14%, Italy 0.92%) are -EV at offered odds
+- Sweet spot: 50-65x odds in Germany/Champions/CWC = genuine +EV
 
 The adaptive system:
 1. Tracks JP rates per category x odds-range from ALL data
 2. Recomputes every LEARN_INTERVAL rounds
 3. Only enables category x range combos with EV > MIN_EV_THRESHOLD
-4. Disables categories/ranges that drop below breakeven
-5. Picks up new edges as they emerge
+4. Hard caps odds at MAX_ODDS (65x) — nothing above this
+5. Only evaluates 3 proven categories
 """
 
 from __future__ import annotations
@@ -38,18 +40,18 @@ MIN_ODDS_RECORDS = 50        # Min AH odds records for a category x range
 MIN_EV_THRESHOLD = 0.05      # Only bet when EV > 5%
 MAX_BETS_PER_ROUND = 30      # SportyBet limit
 DEFAULT_STAKE = 10.0
+MAX_ODDS = 65.0              # Hard cap — odds above this are -EV traps
 
-# Odds ranges for jackpot analysis
+# Odds ranges for jackpot analysis (capped at MAX_ODDS)
 ODDS_RANGES = [
-    ('50-60', 50, 60),
-    ('60-75', 60, 75),
-    ('75-100', 75, 100),
+    ('50-57', 50, 57),
+    ('57-65', 57, 65),
 ]
 
-# Categories to evaluate (all 8)
+# Only categories with AH rate >= 1.8% (proven from 9,751 matches)
+# Germany 2.22%, Champions 2.00%, Club World Cup 1.88%
 ALL_CATEGORIES = [
-    'England', 'Spain', 'Germany', 'Champions',
-    'Italy', 'African Cup', 'Euros', 'Club World Cup',
+    'Germany', 'Champions', 'Club World Cup',
 ]
 
 
@@ -225,8 +227,17 @@ def learn_from_data(conn: sqlite3.Connection) -> dict:
 def should_bet_jackpot(category: str, ah_odds: float, active_markets: list) -> Optional[ActiveMarket]:
     """Check if we should bet Away/Home on this fixture.
 
+    Hard filters:
+    - Category must be in ALL_CATEGORIES (Germany, Champions, Club World Cup)
+    - Odds must be in [50, MAX_ODDS) range
+    - Must match an enabled ActiveMarket with EV > threshold
+
     Returns the matching ActiveMarket if +EV, or None.
     """
+    if category not in ALL_CATEGORIES:
+        return None
+    if ah_odds >= MAX_ODDS or ah_odds < 50:
+        return None
     for m in active_markets:
         if m.category == category and m.odds_lo <= ah_odds < m.odds_hi and m.enabled:
             return m

@@ -37,15 +37,17 @@ SPORTYBET_VIRTUALS_URL = "https://www.sportybet.com/ng/sporty-instant-virtuals?f
 
 LEARN_INTERVAL = 10  # Re-analyze data every N rounds
 MIN_SAMPLES = 50     # Minimum matches for a team/category before trusting its rate
-CATEGORY_THRESHOLD = 1.5    # Bet on categories with jackpot rate >= this %
+CATEGORY_THRESHOLD = 1.8    # Bet on categories with jackpot rate >= this %
 TEAM_MIN_JACKPOTS = 2      # Team needs >= this many jackpots to be targeted
 MIN_ODDS = 50.0            # Only bet when Away/Home odds >= this value
+MAX_ODDS = 65.0            # Hard cap — odds above this are -EV traps
 
 # Categories with PROVEN negative EV — never bet here regardless of teams
-BLACKLIST_CATEGORIES = {"England", "Italy"}
+# Only Germany (2.22%), Champions (2.00%), Club World Cup (1.88%) are +EV
+BLACKLIST_CATEGORIES = {"England", "Italy", "Spain", "Euros", "African Cup"}
 
-# Initial targets (from 328 rounds / 29,131 matches analysis)
-# These get overwritten by learn_from_data() after first interval.
+# Initial targets (from 110 rounds / 9,751 matches deep dive)
+# Only categories with AH rate >= 1.8% — rest are -EV
 TARGET_CATEGORIES = {"Club World Cup", "Germany", "Champions"}
 TARGET_HOME_TEAMS = {
     "PSG", "ARS", "ATM", "BAY", "NEW", "ENG", "FLU", "HIL",
@@ -1450,52 +1452,139 @@ async def clear_betslip(page) -> int:
     """Clear all pending bets from the betslip.
 
     After a crash/restart, the betslip may still contain bets from
-    the previous session. This function removes them all so we start
-    fresh each round.
+    the previous session. This function:
+    1. Opens the Open Bets panel (bottom left)
+    2. Clicks "Cancel All" or individual cancel buttons
+    3. Deselects any selected outcomes on the page
 
     Returns the number of bets cleared.
     """
     try:
-        cleared = await page.evaluate(r"""() => {
-            // Look for the betslip area and remove/deselect all bets
-            let count = 0;
+        cleared = 0
 
-            // Method 1: Click all "remove bet" (X) buttons in betslip
-            const removeBtns = document.querySelectorAll(
-                '.bet-item .close-icon, .bet-item .remove, ' +
-                '#quick-bet-container .close, .betslip-item .delete'
+        # Step 1: Check if there's an Open Bets badge with a count
+        badge_count = await page.evaluate(r"""() => {
+            const badge = document.querySelector(
+                '.nav-bottom-left .badge, .nav-bottom-left .bet-count, ' +
+                '.action-button-sub-container .badge'
             );
-            for (const btn of removeBtns) {
-                btn.click();
-                count++;
+            if (badge) {
+                const n = parseInt((badge.textContent || '').trim());
+                return isNaN(n) ? 0 : n;
             }
+            // Check for text like "Open Bets 10"
+            const el = document.querySelector('.nav-bottom-left');
+            if (el) {
+                const m = (el.textContent || '').match(/(\d+)/);
+                return m ? parseInt(m[1]) : 0;
+            }
+            return 0;
+        }""")
 
-            // Method 2: Deselect all currently selected outcomes
+        if badge_count and badge_count > 0:
+            print(f"  Found {badge_count} stale bet(s) in Open Bets")
+
+            # Click Open Bets to open the panel
+            await page.evaluate(r"""() => {
+                const el = document.querySelector(
+                    '[data-op="iv-main-open-bets"], ' +
+                    '.nav-bottom-left .action-button-sub-container, ' +
+                    '.nav-bottom-left'
+                );
+                if (el) { el.click(); return true; }
+                return false;
+            }""")
+            await asyncio.sleep(1.5)
+
+            # Try "Cancel All" button
+            cancel_all = await page.evaluate(r"""() => {
+                const btns = document.querySelectorAll(
+                    '[data-cms-key="cancel_all"], .cancel-all, ' +
+                    '[data-op*="cancel"], .open-bets-cancel-all'
+                );
+                for (const btn of btns) {
+                    if (btn.offsetHeight > 0) { btn.click(); return true; }
+                }
+                // Text search for "Cancel All"
+                const all = document.querySelectorAll('span, div, button');
+                for (const el of all) {
+                    const txt = (el.textContent || '').trim();
+                    if (txt === 'Cancel All' && el.offsetHeight > 0 && el.children.length < 3) {
+                        el.click(); return true;
+                    }
+                }
+                return false;
+            }""")
+            if cancel_all:
+                await asyncio.sleep(1)
+                # Confirm cancellation if dialog appears
+                await page.evaluate(r"""() => {
+                    const btns = document.querySelectorAll(
+                        '#confirm-btn, [data-cms-key="confirm"], ' +
+                        '.es-dialog-wrap .confirm, .es-dialog-wrap button'
+                    );
+                    for (const btn of btns) {
+                        const txt = (btn.textContent || '').trim().toLowerCase();
+                        if (txt.includes('confirm') || txt.includes('yes') || txt.includes('ok')) {
+                            btn.click(); return true;
+                        }
+                    }
+                    return false;
+                }""")
+                await asyncio.sleep(1)
+                cleared = badge_count
+                print(f"  Cancelled {badge_count} stale bet(s)")
+            else:
+                # Try individual cancel/remove buttons
+                removed = await page.evaluate(r"""() => {
+                    let count = 0;
+                    const btns = document.querySelectorAll(
+                        '.bet-item .close-icon, .bet-item .remove, ' +
+                        '.open-bet-item .cancel, .open-bet-item .close, ' +
+                        '.betslip-item .delete, .betslip-item .close'
+                    );
+                    for (const btn of btns) {
+                        btn.click(); count++;
+                    }
+                    return count;
+                }""")
+                if removed:
+                    await asyncio.sleep(1)
+                    cleared = removed
+                    print(f"  Removed {removed} individual bet(s)")
+
+            # Click back/close to dismiss the Open Bets panel
+            await page.evaluate(r"""() => {
+                const back = document.querySelector(
+                    '.open-bets-back, .betslip-close, ' +
+                    '[data-op="iv-header-back-icon"], .m-left-icon'
+                );
+                if (back) { back.click(); return true; }
+                return false;
+            }""")
+            await asyncio.sleep(1)
+
+        # Step 2: Deselect any selected outcomes on the betting page
+        deselected = await page.evaluate(r"""() => {
+            let count = 0;
             const selected = document.querySelectorAll(
                 '.iw-outcome.active, .iw-outcome.selected, ' +
                 '.iw-outcome[class*="active"], .m-outcome-odds-des.active'
             );
             for (const sel of selected) {
-                sel.click();
-                count++;
+                sel.click(); count++;
             }
-
-            // Method 3: Click "Clear All" or "Remove All" if present
-            const clearBtns = document.querySelectorAll(
-                '[data-cms-key="clear_all"], [data-cms-key="remove_all"], ' +
-                '.clear-all, .remove-all'
-            );
-            for (const btn of clearBtns) {
-                btn.click();
-                count++;
-            }
-
             return count;
         }""")
-        if cleared and cleared > 0:
-            print(f"  Cleared {cleared} stale bet(s) from betslip")
+        if deselected:
+            print(f"  Deselected {deselected} outcome(s)")
+            cleared += deselected
             await asyncio.sleep(1)
-        return cleared or 0
+
+        return cleared
+    except Exception as e:
+        print(f"  Clear betslip error: {e}")
+        return 0
     except Exception:
         return 0
 
@@ -1878,9 +1967,13 @@ async def place_strategic_bets(page, fixtures: list[dict], selection: str = "Awa
                 ah_odds = odds.get('away_home')
                 print(f"    \U0001f4ca Away/Home odds: {ah_odds}")
                 
-                # Odds filter: skip if below minimum threshold
+                # Odds filter: skip if outside [MIN_ODDS, MAX_ODDS] range
                 if ah_odds is not None and ah_odds < MIN_ODDS:
                     print(f"    \u26a0\ufe0f  Odds too low ({ah_odds} < {MIN_ODDS}), skipping")
+                    await go_back_to_betting(page)
+                    continue
+                if ah_odds is not None and ah_odds > MAX_ODDS:
+                    print(f"    \u26a0\ufe0f  Odds too high ({ah_odds} > {MAX_ODDS}), skipping")
                     await go_back_to_betting(page)
                     continue
 
