@@ -504,9 +504,9 @@ async def wait_for_login(page: Page):
                     )
                     await asyncio.sleep(3)
                     break
-        else:
-            print("❌ Login timed out. Please restart and try again.")
-            raise SystemExit(1)
+            else:
+                print("❌ Login timed out. Please restart and try again.")
+                raise SystemExit(1)
 
     # ── Wait for the iframe to appear ────────────────────────
     print("⏳ Waiting for virtual soccer to load...")
