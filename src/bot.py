@@ -3409,7 +3409,7 @@ def main():
     if args.inspect:
         asyncio.run(_inspect_mode())
     elif args.scrape_odds:
-        asyncio.run(run_odds_scraper(rounds=args.rounds))
+        asyncio.run(run_odds_scraper(rounds=args.rounds, headless=args.headless))
     else:
         asyncio.run(run_scraper(
             rounds=args.rounds,
@@ -3420,7 +3420,7 @@ def main():
         ))
 
 
-async def run_odds_scraper(rounds: int = 1) -> None:
+async def run_odds_scraper(rounds: int = 1, headless: bool = False) -> None:
     """Dedicated odds-scraping mode.
 
     Opens every fixture on the betting screen and scrapes all O/U, HT/FT,
@@ -3433,7 +3433,7 @@ async def run_odds_scraper(rounds: int = 1) -> None:
     conn = _get_conn()
     _init_db(conn)
 
-    pw, context, page = await launch_browser(headless=False)
+    pw, context, page = await launch_browser(headless=headless)
     data_dir = Path(__file__).parent.parent / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
     all_rounds_data = []
