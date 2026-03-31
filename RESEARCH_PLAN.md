@@ -49,29 +49,36 @@ SportyBet systematically underprices the Away/Home outcome in the 55-75x odds ra
 
 ## 2. Current State
 
-### Data collected (as of March 31, 2026):
-| Table | Records |
-|-------|---------|
-| rounds | 124 |
-| matches | 10,997 |
-| bets | 321 |
-| market_odds | 1,307,480 |
-| fixture_odds | 0 |
-| htft_odds | 0 |
+### Deployment status (as of March 31, 2026):
+**LIVE on Hetzner server** — running 24/7 in observe mode with HT/FT odds scraping.
+- Service: `sportybot.service` (systemd, auto-restart on failure)
+- Watchdog: `watchdog.sh` kills process if no output for 10 minutes
+- Dashboard: [probodds.com/sportybot/](https://probodds.com/sportybot/)
+- API: `https://probodds.com/api/sportybot/status` (JSON)
 
-### Betting performance:
+### Data collected (live — updating continuously):
+| Table | Records | Notes |
+|-------|---------|-------|
+| rounds | 130+ | ~89 matches per round |
+| matches | 11,570+ | HT/FT scores for all categories |
+| bets | 0 | Observe-only mode (1 throwaway bet/round, not tracked) |
+| market_odds | 156,841+ | All market types (HT/FT, 1X2, O/U, etc.) |
+| — HT/FT odds | 52,119 | 9 selections per fixture |
+| — Away/Home odds | 5,791 | The jackpot odds specifically |
+
+### Phase 1 results (completed, from local machine):
 - **Old strategy (bets 1-215):** 1 win / 215 bets, -68.7% ROI. Bet on everything 50-100x across all categories. Failed badly.
 - **New strategy (bets 216-321):** ~4 wins / ~106 bets, +82.4% ROI. Restricted to 50-65x in Germany/Champions/Club World Cup only.
-- **Overall:** ~5 wins in 321 bets, approximately -NGN 200 net.
+- **Overall Phase 1:** ~5 wins in 321 bets, approximately -NGN 200 net.
 
-### Current strategy (in code right now):
-- Only bets on Germany, Champions, Club World Cup categories
-- Only bets when AH odds are between 50x and 65x
-- Adaptive: re-learns from DB every 10 rounds
-- ~5-10 bets per round at NGN 10 each
+### Phase 2 (current — data collection only):
+- Pure observation mode: scrapes results + HT/FT odds, places 1 min bet (NGN 10) per round to access results
+- No strategic bets — all data collection for statistical testing
+- Target: 1,500 rounds for 80% power on H1 (55-75x bracket hypothesis)
+- Cost: NGN 10/round × 1,500 = NGN 15,000 (~$9 USD) in throwaway bets
 
 ### What's NOT proven yet:
-Everything. No result is statistically significant at 95% confidence. Current sample sizes are too small (122 rounds, ~2,400 fixtures in the target bracket) to distinguish signal from noise.
+Everything. No result is statistically significant at 95% confidence. Phase 1 sample sizes were too small. Phase 2 aims to reach significance.
 
 ---
 
@@ -154,45 +161,72 @@ Legacy tables from earlier scraping attempts. Both empty (0 rows). Can be ignore
 ```
 src/
   __main__.py    -- CLI entry: `python -m src bot [--flags]`
-  bot.py         -- Playwright browser automation (~3,200 lines)
+  bot.py         -- Playwright browser automation (~3,400 lines)
   db.py          -- SQLite schema, insert/query functions
   strategies.py  -- Adaptive jackpot strategy engine
-  analyze.py     -- (Unused currently)
+  analyze.py     -- Statistical analysis (unused during collection)
+
+Server-side support files:
+  status.py      -- CLI status dashboard
+  api.py         -- JSON status API (port 8007, behind nginx)
+  verify_data.py -- Data verification script
+  watchdog.sh    -- Process watchdog (kills if hung >10 min)
 ```
 
 ### CLI commands
 ```bash
 # Main modes:
-python -m src bot --rounds 0 --steady          # Jackpot strategy betting (current mode)
-python -m src bot --rounds 0                    # Observe mode (1 min bet, collect results)
+python -m src bot --rounds 0 --headless         # Observe mode with HT/FT odds scraping (CURRENT)
+python -m src bot --rounds 0 --headless --steady # Jackpot strategy betting
 python -m src bot --rounds 0 --bet              # Legacy strategy (place_strategic_bets)
-python -m src bot --rounds 0 --scrape-odds      # Dedicated odds scraping (no betting)
+python -m src bot --rounds 0 --scrape-odds --headless  # Dedicated odds scraping only
 python -m src bot --inspect                     # Open browser to examine DOM
 
 # Flags:
 --rounds N       # 0 = run forever, N = stop after N rounds
---headless       # Run without visible browser (for servers)
+--headless       # Run without visible browser (required for server)
 --steady         # Use jackpot strategy from strategies.py
+--scrape-odds    # Dedicated odds-only scraping mode
 ```
 
-### Round lifecycle (--steady mode)
+### Auto-login
+The bot supports automatic login via environment variables:
+```bash
+# In .env file (gitignored):
+SPORTYBET_PHONE=08012345678
+SPORTYBET_PASSWORD=yourpassword
+```
+On startup, if the persistent browser session is expired, the bot:
+1. Clicks the Login button on the SportyBet page
+2. Fills phone number and password from env vars
+3. Submits the form and waits for NGN balance to appear
+4. Falls back to manual login if auto-login fails
+
+Session expiry during operation also triggers auto-login automatically.
+
+### Round lifecycle (observe mode — current deployment)
 1. **Detect screen** — betting, live, or results
 2. **Betting screen:**
-   - Clear stale bets from previous crash
-   - Scrape 77 fixtures with 1X2 odds from the list
-   - For each fixture: open detail → scrape all market odds → check AH odds → if +EV, place bet
+   - Scrape 77 fixtures with 1X2 odds from the fixture list
+   - Store 1X2 odds to `market_odds` table
+   - **Open each fixture's detail page** (per category tab):
+     - Scrape all HT/FT, O/U, and other market odds
+     - Store to `market_odds` table
+     - 5-minute global timeout — if scraping all 77 fixtures takes too long, moves on
+     - 10-second timeout per fixture's `scrape_all_market_odds()` call
+   - Place 1 throwaway bet (Away/Home on first fixture, NGN 10) to trigger results
    - Click "Open Bets" → "Kick Off" → "Skip to Result"
 3. **Results screen:**
    - Scrape all 89 match results across 8 category tabs
-   - Store to DB, settle bets, compute P&L
+   - Store to DB with HT/FT derivation (ht_result, ft_result, htft_result, is_jackpot)
    - Click "Next Round" → repeat
 
 ### Persistent browser profile
-Login cookies are saved at `data/browser_profile/`. Once logged in manually on the first run, subsequent runs reuse the session. The bot detects login state via page content (NGN balance visible = logged in).
+Login cookies are saved at `data/browser_profile/`. The bot auto-logs in using credentials from `.env` if the session has expired. No manual intervention needed for headless server operation.
 
-### Data for the next session needs to know
+### Key constraint
 - The bot REQUIRES at least 1 bet per round to see results (SportyBet won't show results without a placed bet)
-- In observe mode, it places 1 "Away/Home" bet on the first fixture as a throwaway
+- In observe mode, it places 1 "Away/Home" bet on the first fixture as a throwaway (NGN 10/round)
 
 ---
 
@@ -418,55 +452,22 @@ The game has no exploitable edge. Stop betting. The system becomes a pure data c
 
 ---
 
-## 10. Deployment Guide (Hetzner)
+## 10. Deployment Guide (Hetzner) — CURRENT LIVE DEPLOYMENT
 
-### Prerequisites on the server
-```bash
-# Ubuntu/Debian assumed
-sudo apt update
-sudo apt install -y python3.12 python3.12-venv git
+### Server details
+- **Host:** 188.34.136.239 (Hetzner, 64 GB RAM, Ubuntu)
+- **Location:** `/opt/probodds/sportybet/`
+- **Python:** 3.12, venv at `.venv/`
+- **Browser:** Playwright Chromium headless
+- **Credentials:** `.env` file (gitignored, owner-read only)
 
-# Clone repo
-git clone https://github.com/pizzatipz/sportybet-instantvirtual.git
-cd sportybet-instantvirtual
+### Services running
+| Service | Purpose | Port |
+|---------|---------|------|
+| `sportybot.service` | Data collection bot (Playwright + Chromium) | — |
+| `sportybot-api.service` | JSON status API | 8007 (behind nginx) |
 
-# Create venv
-python3.12 -m venv .venv
-source .venv/bin/activate
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Install Playwright browsers
-playwright install chromium
-playwright install-deps chromium
-```
-
-### First run (need to login manually once)
-```bash
-# Run WITHOUT headless to get the browser window
-# SSH with X forwarding: ssh -X user@server
-# Or use a VNC/remote desktop session
-python -m src bot --rounds 1
-
-# Log in to SportyBet in the browser window
-# The session cookies will be saved to data/browser_profile/
-# After login, Ctrl+C to stop
-```
-
-### Data collection run (headless, long-running)
-```bash
-# Use screen/tmux to persist after SSH disconnects
-tmux new -s sportybot
-
-# Run observe-only mode
-python -m src bot --rounds 0 --headless
-
-# Detach: Ctrl+B then D
-# Reattach: tmux attach -t sportybot
-```
-
-### Or with systemd service:
+### systemd service configuration
 ```ini
 # /etc/systemd/system/sportybot.service
 [Unit]
@@ -475,48 +476,66 @@ After=network.target
 
 [Service]
 Type=simple
-User=ubuntu
-WorkingDirectory=/home/ubuntu/sportybet-instantvirtual
-ExecStart=/home/ubuntu/sportybet-instantvirtual/.venv/bin/python -m src bot --rounds 0 --headless
+User=root
+WorkingDirectory=/opt/probodds/sportybet
+ExecStart=/opt/probodds/sportybet/watchdog.sh
 Restart=on-failure
 RestartSec=30
-Environment=DISPLAY=:0
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sportybot
+Environment=HOME=/root
 
 [Install]
 WantedBy=multi-user.target
 ```
+
+The `watchdog.sh` wrapper runs the bot and monitors stdout. If no output for 10 minutes (indicating the bot is hung on a Playwright call), it kills the process. systemd's `Restart=on-failure` then restarts it after 30 seconds.
+
+### Auto-login configuration
 ```bash
-sudo systemctl enable sportybot
-sudo systemctl start sportybot
-sudo journalctl -u sportybot -f  # watch logs
+# /opt/probodds/sportybet/.env (chmod 600)
+SPORTYBET_PHONE=08012345678
+SPORTYBET_PASSWORD=yourpassword
 ```
+
+The bot loads these on startup and auto-logs in when:
+1. First launch (no saved session)
+2. Session expiry during operation
+3. Restart after crash
+
+No manual login or VNC/X11 forwarding needed.
 
 ### Monitoring
 ```bash
-# Quick status check
-python -c "
-import sqlite3
-c = sqlite3.connect('data/sportybet.db')
-r = c.execute('SELECT COUNT(*) FROM rounds').fetchone()[0]
-m = c.execute('SELECT COUNT(*) FROM matches').fetchone()[0]
-jp = c.execute('SELECT COUNT(*) FROM matches WHERE is_jackpot=1').fetchone()[0]
-rate = jp/m*100 if m > 0 else 0
-print(f'Rounds: {r} | Matches: {m} | Jackpots: {jp} | Rate: {rate:.2f}%')
-c.close()
-"
+# Live dashboard (browser/phone)
+https://probodds.com/sportybot/
+
+# JSON API
+curl -s https://probodds.com/api/sportybot/status | python3 -m json.tool
+
+# CLI status
+ssh root@188.34.136.239 "cd /opt/probodds/sportybet && .venv/bin/python status.py"
+
+# Live logs
+ssh root@188.34.136.239 "journalctl -u sportybot -f"
+
+# Service control
+ssh root@188.34.136.239 "systemctl status|restart|stop sportybot"
 ```
 
 ### Database backup
 ```bash
-# The DB is in WAL mode, so copy both files
-cp data/sportybet.db data/sportybet.db-backup
-cp data/sportybet.db-wal data/sportybet.db-wal-backup 2>/dev/null
+# Manual backup
+ssh root@188.34.136.239 "cp /opt/probodds/sportybet/data/sportybet.db /opt/probodds/backups/sportybet_\$(date +%Y%m%d).db"
+
+# Download to local
+scp root@188.34.136.239:/opt/probodds/sportybet/data/sportybet.db ./data/
 ```
 
-### Transferring the database
+### Updating the bot
 ```bash
-# From server to local machine
-scp user@server:~/sportybet-instantvirtual/data/sportybet.db ./data/
+ssh root@188.34.136.239 "cd /opt/probodds/sportybet && git pull origin main && systemctl restart sportybot"
 ```
 
 ---
@@ -525,87 +544,78 @@ scp user@server:~/sportybet-instantvirtual/data/sportybet.db ./data/
 
 | File | Purpose | Lines |
 |------|---------|-------|
-| `src/bot.py` | Browser automation, scraping, betting flow | ~3,240 |
+| `src/bot.py` | Browser automation, auto-login, odds scraping, result scraping | ~3,400 |
 | `src/db.py` | SQLite schema and CRUD operations | ~350 |
 | `src/strategies.py` | Jackpot strategy engine with adaptive learning | ~300 |
 | `src/__main__.py` | CLI entry point | ~20 |
-| `src/analyze.py` | Analysis utilities (minimal currently) | ~50 |
+| `src/analyze.py` | Analysis utilities (for post-collection) | ~50 |
+| `status.py` | CLI status dashboard (rounds, matches, jackpots, categories) | ~80 |
+| `api.py` | JSON HTTP status API (port 8007) | ~80 |
+| `verify_data.py` | Data verification (table counts, odds breakdown, join test) | ~70 |
+| `watchdog.sh` | Process watchdog — kills if no output >10 min | ~20 |
+| `.env.example` | Credentials template | ~3 |
 | `requirements.txt` | Python dependencies | ~9 |
-| `data/sportybet.db` | The database (primary asset) | - |
-| `data/browser_profile/` | Chromium login session cookies | - |
-
-### strategies.py key functions:
-- `learn_from_data(conn)` → Analyzes all match data, computes +EV categories/odds ranges, returns `active_markets` list
-- `should_bet_jackpot(category, ah_odds, active_markets)` → Returns matching `ActiveMarket` if +EV, or `None`
-- `settle_bets(conn, round_id, matches)` → Matches unsettled bets to actual results
-- `log_bet(conn, ...)` → Records a bet to the DB
-- `SteadyState` dataclass → Tracks runtime performance (bets, wins, P&L)
+| `data/sportybet.db` | The database (**primary asset** — back up regularly) | — |
+| `data/browser_profile/` | Chromium login session cookies | — |
 
 ### bot.py key functions:
+- `auto_login(page)` → Automatic login using env var credentials
+- `wait_for_login(page)` → Navigate + auto-login or manual login fallback
+- `handle_session_expired(page)` → Auto-login on session expiry
 - `run_scraper(...)` → Main loop (the entry point)
 - `scrape_round_results(page)` → Scrape all match results from results screen
 - `scrape_betting_screen(page)` → Scrape fixture list + 1X2 odds
 - `scrape_all_market_odds(page)` → Scrape HT/FT, O/U, 1X2, etc. from detail page
-- `place_steady_bet(page, ...)` → Place a single bet on a fixture
-- `select_htft_outcome(page, selection)` → Click an HT/FT outcome on detail page
-- `click_place_bet(page)` → Click "Place Bet" button
-- `click_confirm(page)` → Click "Confirm" button
-- `click_kick_off(page)` → Click "Kick Off" button
-- `click_skip_to_result(page)` → Click "Skip to Result" button
-- `clear_betslip(page)` → Remove stale bets after crash/restart
 - `detect_screen(page)` → Returns "betting", "live", "results", or "unknown"
 - `recover_iframe(page)` → Re-locate iframe after page reload
+- `run_odds_scraper(...)` → Dedicated odds-only scraping mode
 
 ---
 
 ## 12. Known Issues
 
-### Crashes (primary issue)
-- **Cause:** Chromium `STATUS_BREAKPOINT` — out-of-memory crash
-- **Frequency:** Every 5-15 rounds on local Windows machine
-- **Fix:** Hetzner 64GB + headless mode should eliminate this
-- **Workaround:** The bot has auto-recovery (`recover_iframe`), but fatal OOM kills the process entirely
-
-### Stale bets after crash
-- After a crash, previously placed bets remain in the Open Bets panel
-- On restart, new bets are added on top — can exceed 30-bet limit
-- `clear_betslip()` attempts to clear them but may not always work
-- **Impact:** Some bet duplicates in the DB, minor P&L tracking inaccuracy
+### HT/FT odds scraping can hang (MITIGATED)
+- **Cause:** Playwright `evaluate()` or page interaction blocks the asyncio event loop when a detail page is unresponsive
+- **Previous impact:** Bot would hang indefinitely, no new rounds scraped
+- **Mitigation (current):**
+  1. `asyncio.wait_for(scrape_all_market_odds(...), timeout=10.0)` per fixture
+  2. `time.monotonic()` 5-minute global timeout for entire odds scraping loop
+  3. `watchdog.sh` kills the process if no stdout for 10 minutes
+  4. `systemd Restart=on-failure` auto-restarts after 30 seconds
+- **Impact if triggered:** Some HT/FT odds for that round are missed, but results are still scraped normally on the next round
 
 ### Round ID mismatch between tables
 - `matches.round_id` comes from the iframe URL during results scraping
 - `market_odds.round_id` is a timestamp generated during odds scraping
-- They NEVER match. Join on `category + home_team + away_team` instead.
+- They NEVER match. **Join on `category + home_team + away_team` instead.**
 - This is a design bug from when odds scraping was a separate pass
 
-### Login session expiry
-- SportyBet sessions expire after some hours
-- The bot detects this and waits for re-login
-- On headless Hetzner, you'd need to re-login via VNC/X forwarding
-- Consider implementing auto-login (phone + password) for true unattended operation
-
-### Observe mode still places 1 bet per round
+### Observe mode throwaway bet cost
 - SportyBet requires at least 1 placed bet to show match results
-- The bot places an "Away/Home" bet on the first fixture as a throwaway
-- Cost: NGN 10 per round. Over 1,500 rounds = NGN 15,000
+- The bot places an "Away/Home" bet on the first fixture (NGN 10) each round
+- Cost: NGN 10/round × 1,500 rounds = NGN 15,000 (~$9 USD)
+- These throwaway bets are NOT tracked in the `bets` table
+
+### OOM crashes on low-memory machines (RESOLVED)
+- **Cause:** Chromium `STATUS_BREAKPOINT` on Windows with limited RAM
+- **Fix:** Hetzner 64GB server + headless mode — no OOM since deployment
+- **History:** Occurred every 5-15 rounds on local Windows machine
 
 ---
 
 ## 13. Important Warnings
 
-1. **Do NOT kill all python/chrome processes blindly.** If other bots are running, it kills them too. Always check what's running first.
+1. **Do NOT kill all python/chrome processes blindly.** Other services (parlay trader, basketball, collector) run on the same server. Use `systemctl stop sportybot` or `kill` only the specific PID.
 
-2. **The current strategy has hardcoded category filters** (Germany, Champions, Club World Cup). The plan is to make this fully data-driven after collecting 1,500+ rounds. Don't change the strategy until you have the data.
+2. **The database is the most valuable asset.** Back it up regularly. All analysis depends on having a large, clean dataset. The database is at `/opt/probodds/sportybet/data/sportybet.db`.
 
-3. **The database is the most valuable asset.** Back it up regularly. All analysis depends on having a large, clean dataset.
+3. **Phase 2 is observe-only.** Do NOT switch to `--steady` mode until 1,500+ rounds of data are collected and analyzed. The strategy can only be validated with sufficient statistical power.
 
-4. **The edge (if it exists) is small.** ~0.18 percentage points above implied rate. This is NOT a "get rich quick" situation. Expected ROI is ~10% with high variance. Cold streaks of 10-20 rounds with zero wins are normal (25% chance in 10 rounds).
+4. **The edge (if it exists) is small.** ~0.18 percentage points above implied rate. Expected ROI ~10% with high variance. Cold streaks of 10-20 rounds with zero wins are normal.
 
-5. **SportyBet could change the RNG at any time.** The system should detect this via the stability hypothesis (H5), but there's always a lag.
+5. **SportyBet could change the RNG at any time.** Monitor the overall jackpot rate on the dashboard. If it drifts below 1.3% sustained, the RNG may have changed.
 
-6. **Headless mode has not been extensively tested.** The bot was developed with visible browser. Some DOM elements or timing may behave differently headless. Test with `--headless` flag before deploying.
-
-7. **The `--steady` flag is the current betting mode.** The `--bet` flag is a legacy mode that uses the old `place_strategic_bets()` function with `fixture_matches_strategy()`. Don't use `--bet`.
+6. **The parlay system runs on port 8006.** Do NOT use port 8006 for anything sportybot-related. The sportybot API is on port 8007.
 
 ---
 
