@@ -2508,7 +2508,17 @@ async def run_scraper(rounds: int = 0, headless: bool = False, manual: bool = Fa
             if screen == "betting":
               try:
                 # Clear any stale bets from previous session/crash
-                await clear_betslip(target)
+                # Wrapped in try/except — if clearing fails, proceed anyway.
+                # A stale bet doesn't prevent placing a new one or scraping results.
+                try:
+                    await clear_betslip(target)
+                except Exception as _cbe:
+                    print(f"  (Betslip clear skipped: {str(_cbe)[:60]})")
+                    # Re-acquire iframe in case clear_betslip detached it
+                    try:
+                        target = await recover_iframe(page)
+                    except Exception:
+                        pass
 
                 round_id, fixtures = await scrape_betting_screen(target)
                 # Generate a temporary round_id if URL didn't provide one
