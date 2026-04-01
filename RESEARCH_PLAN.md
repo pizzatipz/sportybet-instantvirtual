@@ -49,36 +49,36 @@ SportyBet systematically underprices the Away/Home outcome in the 55-75x odds ra
 
 ## 2. Current State
 
-### Deployment status (as of March 31, 2026):
-**LIVE on Hetzner server** — running 24/7 in observe mode with HT/FT odds scraping.
-- Service: `sportybot.service` (systemd, auto-restart on failure)
-- Watchdog: `watchdog.sh` kills process if no output for 10 minutes
-- Dashboard: [probodds.com/sportybot/](https://probodds.com/sportybot/)
-- API: `https://probodds.com/api/sportybot/status` (JSON)
+### STATUS: RESEARCH CONCLUDED (April 1, 2026)
 
-### Data collected (live — updating continuously):
-| Table | Records | Notes |
-|-------|---------|-------|
-| rounds | 130+ | ~89 matches per round |
-| matches | 11,570+ | HT/FT scores for all categories |
-| bets | 0 | Observe-only mode (1 throwaway bet/round, not tracked) |
-| market_odds | 156,841+ | All market types (HT/FT, 1X2, O/U, etc.) |
-| — HT/FT odds | 52,119 | 9 selections per fixture |
-| — Away/Home odds | 5,791 | The jackpot odds specifically |
+Data collection is complete. Both services (`sportybot`, `sportybot-api`) are stopped and disabled on the Hetzner server. The primary hypothesis (H1) was not confirmed. No exploitable edge exists.
 
-### Phase 1 results (completed, from local machine):
-- **Old strategy (bets 1-215):** 1 win / 215 bets, -68.7% ROI. Bet on everything 50-100x across all categories. Failed badly.
-- **New strategy (bets 216-321):** ~4 wins / ~106 bets, +82.4% ROI. Restricted to 50-65x in Germany/Champions/Club World Cup only.
-- **Overall Phase 1:** ~5 wins in 321 bets, approximately -NGN 200 net.
+### Final data:
+| Table | Records |
+|-------|---------|
+| rounds | 1,469 |
+| matches | 130,741 |
+| bets | 0 (observe-only mode) |
+| market_odds | 504,951 |
+| — HT/FT odds | 68,382 |
+| — Away/Home odds | 7,598 |
+| jackpots | 2,014 (1.54%) |
 
-### Phase 2 (current — data collection only):
-- Pure observation mode: scrapes results + HT/FT odds, places 1 min bet (NGN 10) per round to access results
-- No strategic bets — all data collection for statistical testing
-- Target: 1,500 rounds for 80% power on H1 (55-75x bracket hypothesis)
-- Cost: NGN 10/round × 1,500 = NGN 15,000 (~$9 USD) in throwaway bets
+### Analysis results:
+- **H1 (55-75x edge): NOT SIGNIFICANT** (p=0.45, ROI=-0.7%)
+- **H2 (category differences): SIGNIFICANT** but priced into odds by bookmaker
+- **H3 (50-55x dead zone): SIGNIFICANT** (p=0.017) — avoid this bracket
+- **H4 (100x trap): NOT SIGNIFICANT** (p=0.32)
+- **H5 (stability): STABLE** — RNG is random (runs test p=0.66)
+- **H6 (odds vs category): Category effect is priced in** — high-AH categories get lower odds
 
-### What's NOT proven yet:
-Everything. No result is statistically significant at 95% confidence. Phase 1 sample sizes were too small. Phase 2 aims to reach significance.
+### Phase 1 results (from local machine, pre-server):
+- **Old strategy (bets 1-215):** 1 win / 215 bets, -68.7% ROI
+- **New strategy (bets 216-321):** ~4 wins / ~106 bets, +82.4% ROI (small sample luck)
+- **Overall Phase 1:** ~5 wins in 321 bets, approximately -NGN 200 net
+
+### Conclusion:
+The bookmaker's RNG and pricing are well-calibrated. No strategy tested produces positive expected value after proper statistical correction. The initial "signal" in the 55-75x bracket was noise from small sample sizes.
 
 ---
 

@@ -2,50 +2,42 @@
 
 An empirical investigation into whether exploitable patterns exist in SportyBet's Instant Virtual Soccer RNG, specifically in the HT/FT Away/Home ("jackpot") market.
 
-## Status: Phase 2 — Extended Data Collection (In Progress)
+## Final Conclusion (April 1, 2026 — 130,741 matches)
 
-The bot is deployed on a Hetzner server collecting data 24/7. Live status: [probodds.com/sportybot/](https://probodds.com/sportybot/)
+**No exploitable edge exists. The RNG pricing is accurate.**
 
-### Phase 1 Conclusion (51K matches, March 2026)
+After 1,469 rounds, 130,741 matches, and 504,951 odds records:
+- The primary hypothesis (55-75x bracket edge) failed: p=0.45, ROI=-0.7%
+- No odds bracket survives Bonferroni correction for multiple comparisons
+- Category differences are real but already priced into the odds
+- The 50-55x range is confirmed as slightly -EV (p=0.017)
+- The jackpot sequence is random (runs test p=0.66)
+- Every "profitable" combination found is a statistical artifact of data snooping
 
-The initial study with 51,109 matches found the RNG appears fair and bookmaker pricing accurate across broad categories. 13 statistical tests confirmed randomness and independence. However, a potential edge was identified in the **55-75x odds bracket** for the Away/Home jackpot that was NOT statistically significant with the sample size available. Phase 2 extends data collection to 1,500+ rounds to test this hypothesis with 80% statistical power.
+The bookmaker's pricing is well-calibrated. High-AH categories (Club World Cup 1.81%, Germany 1.72%) get lower odds (~56-62x), while low-AH categories (Italy 1.04%, England 1.24%) get higher odds (~83-87x). The category effect is **priced in**.
 
-### Phase 2 Goal (Target: 1,500 rounds / ~133K matches)
+## Data Summary
 
-Test whether the Away/Home hit rate in the 55-75x odds bracket significantly exceeds the implied probability. Current data suggests ~1.74% actual vs ~1.56% implied, which would represent a ~10.6% EV edge — but sample sizes are too small to confirm. Need 30,443 fixtures in the target bracket at 80% power.
+| Metric | Phase 1 (Local) | Phase 2 (Server) | Combined |
+|--------|-----------------|-------------------|----------|
+| Rounds | 576 | 1,469 | 2,045 |
+| Matches | 51,109 | 130,741 | 181,850 |
+| Market odds | 1,307,480 | 504,951 | 1,812,431 |
 
-## Current Data (Live — updating continuously)
+## Hypothesis Results
 
-| Metric | Value |
-|--------|-------|
-| Rounds | 130+ |
-| Matches | 11,570+ |
-| Jackpots (Away/Home) | 180 (1.56%) |
-| HT/FT odds records | 52,119 |
-| Away/Home odds records | 5,791 |
-| Market odds (all types) | 156,841 |
-| Target rounds | 1,500 |
-| Est. completion | ~5 days |
+| # | Hypothesis | Result | p-value |
+|---|---|---|---|
+| H1 | 55-75x bracket has exploitable edge | **NOT SIGNIFICANT** | 0.4545 |
+| H2 | Category matters for AH rate | **SIGNIFICANT** (but priced in) | <0.000001 |
+| H3 | 50-55x is a dead zone | **SIGNIFICANT** | 0.017 |
+| H4 | 100x odds are a trap | **NOT SIGNIFICANT** | 0.321 |
+| H5 | AH rate is stable over time | **STABLE** (runs test p=0.66) | — |
+| H6 | Edge is in odds not categories | **Category effect is priced in** | — |
 
-## Deployment
+## Deployment (CONCLUDED)
 
-The bot runs as a systemd service on the Hetzner server with:
-- **Auto-login:** Credentials from `.env` (SPORTYBET_PHONE / SPORTYBET_PASSWORD)
-- **HT/FT odds scraping:** Opens each fixture detail page to collect Away/Home odds per round
-- **Watchdog:** Kills and restarts if the process hangs for >10 minutes
-- **Auto-restart:** systemd `Restart=on-failure` with 30s delay
-- **Monitoring:** Live dashboard at [probodds.com/sportybot/](https://probodds.com/sportybot/), JSON API at `/api/sportybot/status`
-
-```bash
-# Check status
-ssh root@188.34.136.239 "cd /opt/probodds/sportybet && .venv/bin/python status.py"
-
-# Live logs
-ssh root@188.34.136.239 "journalctl -u sportybot -f"
-
-# Service control
-ssh root@188.34.136.239 "systemctl status|restart|stop sportybot"
-```
+The data collection bot ran on a Hetzner server from March 31 to April 1, 2026. Both services (`sportybot`, `sportybot-api`) are now stopped and disabled. The database is archived at `/opt/probodds/sportybet/data/sportybet.db` on the server.
 
 ## Project Structure
 
